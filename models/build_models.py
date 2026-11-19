@@ -59,7 +59,6 @@ MATS = {
 MAT_ALPHA = {"keepout": 0.15}  # MTL d; Vizard's OBJ loader renders d < 1 transparent
 CELLS_PER_TILE = 8          # SolarPanel001 has an 8 x 8 cell grid per tile
 CELL_M = 0.15               # target cell pitch on a module
-MODULE_GAP_M = 0.015        # visual gap between a module edge and its slot edge
 
 
 # --- textures -------------------------------------------------------------------
@@ -430,7 +429,7 @@ def build_keepout(cfg, n=48):
 
 # --- client ---------------------------------------------------------------------
 
-# Slot-boundary truss: thin enough that a module (MODULE_GAP_M in from each
+# Slot-boundary truss: thin enough that a module (client.module_gap_m in from each
 # slot edge) pulled straight back or carried in its row never touches it.
 BOUNDARY_TUBE_R = 0.012
 TRUSS_TOP_Z, TRUSS_KEEL_Z = -0.065, -1.0
@@ -438,7 +437,7 @@ TRUSS_TOP_Z, TRUSS_KEEL_Z = -0.065, -1.0
 
 def module_visual_m(cfg):
     """Visual edge length of a module: slot minus a gap on each side."""
-    return cfg["client"]["slot_m"] - 2 * MODULE_GAP_M
+    return cfg["client"]["slot_m"] - 2 * cfg["client"]["module_gap_m"]
 
 
 def truss_members(cfg):

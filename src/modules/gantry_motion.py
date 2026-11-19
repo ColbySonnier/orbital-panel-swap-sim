@@ -28,7 +28,6 @@ import numpy as np
 
 from src.geometry import module_center
 
-MODULE_GAP_M = 0.015   # == models.build_models.MODULE_GAP_M (a test checks the panel size)
 STEPS = ["roll_out", "align_waste", "grab", "pull", "shift", "drop_in", "latch", "retract", "roll_home"]
 EVENTS = ["capture", "release_client", "insert_contact", "latched", "release_tool"]
 _I3 = np.eye(3)
@@ -93,18 +92,27 @@ def gantry_layout(cfg):
 def body_half(cfg):
     """Half extents (A axes) of each body's collision box, centered on its frame origin.
 
-    Fork entries cover only the tip head; the shaft is a G2 visual detail."""
+    Forks are not boxes about their origin: see fork_geometry."""
     G, c = cfg["gantry"], cfg["client"]
     bx, bz = G["bridge_size"]
-    p = (c["slot_m"] - 2 * MODULE_GAP_M) / 2
+    p = (c["slot_m"] - 2 * c["module_gap_m"]) / 2
     panel = np.array([p, p, c["module_thick_m"] / 2])
     out = {f"bridge_{k}": np.array([bx / 2, G["rail_y"], bz / 2]) for k in ("A", "B")}
     out["carriage"] = np.array(G["carriage_size"], float) / 2
-    out["fork_W"] = out["fork_F"] = np.array([0.1, 0.1, 0.03])
     out["module_target"] = panel
     for k in range(G["n_fresh"]):
         out[f"spare_{k}"] = panel
     return out
+
+
+def fork_geometry(cfg, which):
+    """Fixed collision/visual boxes of fork `which` in its fork frame (origin at the tip,
+    A axes): [(center_offset, half_extents)]. The telescoping mast from the head up to
+    the carriage is not included."""
+    if which != "W":
+        raise NotImplementedError("fork F geometry pending controller ruling (task G1 fix round 1)")
+    h = cfg["gantry"]["fork_W_head"]
+    return [(np.array(h["offset"], float), np.array(h["size"], float) / 2)]
 
 
 # --- 1-D motion profile --------------------------------------------------------------
@@ -246,7 +254,7 @@ class GantrySequence:
 
         steps.append((t, "pull"))
         m = stroke(g, grip); self.fz["W"].add(t, m)
-        events.append((t + m.time_at(cfg["client"]["module_thick_m"] + 0.02), "release_client"))
+        events.append((t + m.time_at(cfg["client"]["module_thick_m"] + G["release_clear_m"]), "release_client"))
         t += m.duration + settle
 
         steps.append((t, "shift"))
@@ -267,7 +275,7 @@ class GantrySequence:
         self.t_release_tool = t
         m = stroke(g, grip); self.fz["F"].add(t, m)
         dur = m.duration
-        if G.get("index_stack", True) and G["n_fresh"] > 1:
+        if G["index_stack"] and G["n_fresh"] > 1:
             mi = Move1D(0.0, G["stack_dz"], G["contact_mps"], a)
             self.stack.add(t, mi)
             dur = max(dur, mi.duration)

@@ -6,7 +6,7 @@ from models.build_models import module_visual_m, truss_members
 from src.config import load_config
 from src.geometry import module_center, module_ids
 from src.modules.gantry_motion import (GantrySequence, aabb_dist, body_half,
-                                       gantry_layout, seg_aabb_dist)
+                                       fork_geometry, gantry_layout, seg_aabb_dist)
 
 cfg = load_config()
 G = cfg["gantry"]
@@ -124,7 +124,7 @@ def test_event_semantics(seq):
     assert np.isclose(f.fork_z["W"], g, atol=1e-9)
     assert seq.at(ev["capture"] - 1.0).fork_z["W"] < g - 1e-4
     p = seq.at(ev["release_client"]).bodies["module_target"][0]
-    assert np.isclose(SLOT[2] - p[2], cfg["client"]["module_thick_m"] + 0.02, atol=1e-6)
+    assert np.isclose(SLOT[2] - p[2], cfg["client"]["module_thick_m"] + G["release_clear_m"], atol=1e-6)
     p = seq.at(ev["insert_contact"]).bodies["spare_0"][0]
     assert np.isclose(SLOT[2] - p[2], G["contact_zone_m"], atol=1e-6)
     assert seq.at(ev["latched"]).step in ("latch", "retract")
@@ -189,6 +189,27 @@ def test_no_panel_collisions(seq):
     assert worst["frame"] > 0.01
 
 
+def test_fork_W_head_clear(seq):
+    """Fork W head vs panels it does not hold, the seated array, the truss and the bus."""
+    obs = bus_obstacles(cfg)
+    boxes = fork_geometry(cfg, "W")
+    worst = {"panel": np.inf, "truss": np.inf, "bus": np.inf}
+    for t in samples(seq, 0.25):
+        f = seq.at(t)
+        tip = f.bodies["fork_W"][0]
+        for off, h in boxes:
+            c = tip + off
+            for n in PANELS[1:]:
+                worst["panel"] = min(worst["panel"], aabb_dist(c, h, f.bodies[n][0], PANEL_HALF))
+            for sc in SEATED:
+                if np.linalg.norm(sc - c) < 3:
+                    worst["panel"] = min(worst["panel"], aabb_dist(c, h, sc, PANEL_HALF))
+            worst["truss"] = min(worst["truss"], truss_clearance(c, h))
+            worst["bus"] = min(worst["bus"], min(obstacle_dist(o, c, h) for o in obs))
+    print("fork W head min clearance (m):", worst)
+    assert worst["panel"] > 0.01 and worst["truss"] > 0.01 and worst["bus"] >= 0.1
+
+
 def test_bridge_clears_bus(seq):
     """Review Focus 3: gantry bodies stay >= 0.1 m from the bus, wings and standoff."""
     half = body_half(cfg)
@@ -240,7 +261,7 @@ def test_mechanism_connected(seq):
 
 def test_no_teleports(seq):
     """Review Focus 5: no body jumps more than travel_mps * 1 s between 1 s samples."""
-    ts = samples(seq, 1.0)
+    ts = samples(seq, 0.1)
     prev = seq.at(ts[0]).bodies
     worst = 0.0
     for t0, t in zip(ts, ts[1:]):
