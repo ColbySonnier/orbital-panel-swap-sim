@@ -42,7 +42,7 @@ power:
 
 servicer:
   mass_kg: 250
-  inertia: [40, 40, 30]
+  inertia: [30, 40, 40]   # x is the 1.2 m long axis
   size_m: [1.2, 1.0, 1.0]  # bus box (x, y, z), centered at the CoM; +x is the arm face
   prop_kg: 15
   isp_s: 220
