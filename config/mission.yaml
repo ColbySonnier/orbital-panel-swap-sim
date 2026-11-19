@@ -130,8 +130,8 @@ gantry:
   park_x: {A: -8.6, B: 8.6}
   x_limits: {A: [-8.6, -2.6], B: [2.6, 8.6]}
   bay_pitch: 2.1            # bay W / bay F spacing in y
-  bay_z0: -1.4              # bottom magazine panel center z
-  stack_dz: 0.1             # fresh-stack pitch (more negative z upward in the stack)
+  bay_z0: -1.25             # bottom magazine panel center z
+  stack_dz: 0.17            # fresh-stack pitch: thick + grapple gap + fork F head and crossbar + 0.015
   n_fresh: 4
   travel_mps: 0.05          # bridge and carriage
   fork_mps: 0.02
@@ -143,15 +143,19 @@ gantry:
   release_clear_m: 0.02     # release_client once the front face is this far past the back of the slot
   # Builder choices (task G1):
   bridge_size: [0.3, 0.3]   # bridge beam cross-section (x, z); length spans the rails
-  carriage_size: [2.2, 4.3, 0.2]  # carriage plate (x, y, z), centered at carriage_z
-  magazine_top_z: -1.8      # back (-z) end of the magazine, the carriage's +z face
-  carriage_z: -1.9          # midpoint of bridge_z and magazine_top_z
+  carriage_size: [2.2, 4.3, 0.15] # carriage plate (x, y, z), centered at carriage_z
+  magazine_top_z: -1.85     # back (-z) end of the magazine, the carriage's +z face
+  carriage_z: -1.925        # midpoint of bridge_z and magazine_top_z
   carriage_park_y: 0.0
   waste_side: -1            # bay W at carriage_y + waste_side * bay_pitch / 2, bay F opposite
-  index_stack: true         # spares 1-3 drop one stack_dz after spare_0 leaves
   fork_W_head:              # center grapple head, fork frame (origin at the tip, A axes)
     size: [0.2, 0.2, 0.06]
     offset: [0.0, 0.0, -0.03]   # head sits behind (-z of) the tip
+  # Telescoping members run from offset z (fork frame) back to magazine_top_z.
+  fork_W_mast: {size: [0.06, 0.06], offset: [0.0, 0.0, -0.06]}        # (x, y) section
+  fork_F_head: {size: [0.2, 0.2, 0.015], offset: [0.0, 0.0, -0.0075]}
+  fork_F_crossbar: {size: [2.14, 0.2, 0.04], offset: [0.0, 0.0, -0.035]}  # behind the held panel
+  fork_F_arm: {size: [0.04, 0.2], offset: [1.05, 0.0, -0.055]}      # (x, y) section; mirrored to -x
 
 viz:
   save_file: "outputs/servicer_demo.bin"

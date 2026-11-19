@@ -105,14 +105,32 @@ def body_half(cfg):
     return out
 
 
-def fork_geometry(cfg, which):
-    """Fixed collision/visual boxes of fork `which` in its fork frame (origin at the tip,
-    A axes): [(center_offset, half_extents)]. The telescoping mast from the head up to
-    the carriage is not included."""
-    if which != "W":
-        raise NotImplementedError("fork F geometry pending controller ruling (task G1 fix round 1)")
-    h = cfg["gantry"]["fork_W_head"]
-    return [(np.array(h["offset"], float), np.array(h["size"], float) / 2)]
+def fork_geometry(cfg, which, tip_z=None):
+    """Boxes of fork `which` in its fork frame (origin at the tip, A axes):
+    [(center_offset, half_extents)].
+
+    Fork W: a center grapple head on a center mast.
+    Fork F: a thin center head on a crossbar behind the held panel, carried by two
+    outboard arms on the +-x edges (outside the panel footprint, beside the stack).
+    Masts/arms telescope from their offset z back to gantry.magazine_top_z; they are
+    included only when the tip's A-frame z is given."""
+    G = cfg["gantry"]
+    box = lambda d: (np.array(d["offset"], float), np.array(d["size"], float) / 2)
+    if which == "W":
+        out, masts = [box(G["fork_W_head"])], [G["fork_W_mast"]]
+    elif which == "F":
+        out = [box(G["fork_F_head"]), box(G["fork_F_crossbar"])]
+        a = G["fork_F_arm"]
+        masts = [dict(a, offset=[s * a["offset"][0], *a["offset"][1:]]) for s in (1, -1)]
+    else:
+        raise ValueError(which)
+    if tip_z is not None:
+        top = G["magazine_top_z"] - tip_z
+        for m in masts:
+            x, y, z0 = m["offset"]
+            hx, hy = np.array(m["size"], float) / 2
+            out.append((np.array([x, y, (z0 + top) / 2]), np.array([hx, hy, abs(z0 - top) / 2])))
+    return out
 
 
 # --- 1-D motion profile --------------------------------------------------------------
@@ -237,7 +255,6 @@ class GantrySequence:
 
         self.bx, self.cy = _Track(x0), _Track(y0)
         self.fz = {"W": _Track(grip), "F": _Track(grip)}
-        self.stack = _Track(0.0)                    # index offset of spares 1..n-1 (+z)
         steps, events = [], []
         t = 0.0
 
@@ -274,12 +291,7 @@ class GantrySequence:
         events.append((t, "release_tool"))
         self.t_release_tool = t
         m = stroke(g, grip); self.fz["F"].add(t, m)
-        dur = m.duration
-        if G["index_stack"] and G["n_fresh"] > 1:
-            mi = Move1D(0.0, G["stack_dz"], G["contact_mps"], a)
-            self.stack.add(t, mi)
-            dur = max(dur, mi.duration)
-        t += dur + settle
+        t += m.duration + settle                    # crossbar returns under spare_1
 
         steps.append((t, "roll_home"))
         m = travel(y_f, y0); self.cy.add(t, m); t += m.duration + settle
@@ -316,9 +328,8 @@ class GantrySequence:
              "fork_W": tip["W"], "fork_F": tip["F"]}
         b["module_target"] = tip["W"] + up if t >= self.t_capture else slot.copy()
         b["spare_0"] = tip["F"] + up if t <= self.t_release_tool else slot.copy()
-        off = self.stack(t)
-        for k in range(1, G["n_fresh"]):
-            b[f"spare_{k}"] = np.array([x, tip["F"][1], G["bay_z0"] - k * G["stack_dz"] + off])
+        for k in range(1, G["n_fresh"]):              # spares 1..n-1 stay put in bay F
+            b[f"spare_{k}"] = np.array([x, tip["F"][1], G["bay_z0"] - k * G["stack_dz"]])
 
         g = lay["grapple_point"]
         contact = any(np.allclose(tip[k][:2], g[:2]) and abs(fz[k] - g[2]) <= G["contact_zone_m"] + 1e-12

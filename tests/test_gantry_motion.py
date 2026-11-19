@@ -97,7 +97,7 @@ SEATED = [module_center(*rc, cfg) for rc in module_ids(cfg) if rc != TARGET]
 def test_layout_values():
     assert LAY["rail_y"] == 8.6 and LAY["rail_z"] == -2.0 and LAY["bridge_z"] == -2.0
     assert LAY["park_x"] == {"A": -8.6, "B": 8.6}
-    assert LAY["bay_pitch"] == 2.1 and LAY["bay_z0"] == -1.4 and LAY["stack_dz"] == 0.1
+    assert LAY["bay_pitch"] == 2.1 and LAY["bay_z0"] == -1.25 and LAY["stack_dz"] == 0.17
     assert np.allclose(LAY["grapple_point"], SLOT + [0, 0, -0.075])
     assert np.isclose(LAY["carriage_z"], (G["bridge_z"] + G["magazine_top_z"]) / 2)
 
@@ -189,25 +189,86 @@ def test_no_panel_collisions(seq):
     assert worst["frame"] > 0.01
 
 
-def test_fork_W_head_clear(seq):
-    """Fork W head vs panels it does not hold, the seated array, the truss and the bus."""
+def held(seq, f, t):
+    """{fork: panel it holds at t}."""
+    ev = dict((n, tt) for tt, n in seq.events)
+    out = {}
+    if t >= ev["capture"]:
+        out["W"] = "module_target"
+    if t <= ev["release_tool"]:
+        out["F"] = "spare_0"
+    return out
+
+
+@pytest.fixture(scope="module")
+def fork_clearance(seq):
+    """Min clearances of each fork's boxes (head, crossbar, masts/arms) over 0.25 s samples."""
     obs = bus_obstacles(cfg)
-    boxes = fork_geometry(cfg, "W")
-    worst = {"panel": np.inf, "truss": np.inf, "bus": np.inf}
+    w = {k: {"panel": np.inf, "spare_1_3": np.inf, "module_target": np.inf, "seated": np.inf,
+             "truss": np.inf, "other_fork": np.inf, "bus": np.inf} for k in ("W", "F")}
     for t in samples(seq, 0.25):
         f = seq.at(t)
-        tip = f.bodies["fork_W"][0]
-        for off, h in boxes:
-            c = tip + off
-            for n in PANELS[1:]:
-                worst["panel"] = min(worst["panel"], aabb_dist(c, h, f.bodies[n][0], PANEL_HALF))
-            for sc in SEATED:
-                if np.linalg.norm(sc - c) < 3:
-                    worst["panel"] = min(worst["panel"], aabb_dist(c, h, sc, PANEL_HALF))
-            worst["truss"] = min(worst["truss"], truss_clearance(c, h))
-            worst["bus"] = min(worst["bus"], min(obstacle_dist(o, c, h) for o in obs))
-    print("fork W head min clearance (m):", worst)
-    assert worst["panel"] > 0.01 and worst["truss"] > 0.01 and worst["bus"] >= 0.1
+        h = held(seq, f, t)
+        boxes = {k: [(f.bodies[f"fork_{k}"][0] + o, hh)
+                     for o, hh in fork_geometry(cfg, k, f.fork_z[k])] for k in ("W", "F")}
+        for k, other in (("W", "F"), ("F", "W")):
+            for c, hh in boxes[k]:
+                for n in PANELS:
+                    if h.get(k) == n:
+                        continue
+                    d = aabb_dist(c, hh, f.bodies[n][0], PANEL_HALF)
+                    w[k]["panel"] = min(w[k]["panel"], d)
+                    key = "module_target" if n == "module_target" else ("spare_1_3" if n != "spare_0" else None)
+                    if key:
+                        w[k][key] = min(w[k][key], d)
+                for sc in SEATED:
+                    if abs(sc[0] - c[0]) < 3 + hh[0] and abs(sc[1] - c[1]) < 3 + hh[1]:
+                        w[k]["seated"] = min(w[k]["seated"], aabb_dist(c, hh, sc, PANEL_HALF))
+                w[k]["truss"] = min(w[k]["truss"], truss_clearance(c, hh))
+                w[k]["bus"] = min(w[k]["bus"], min(obstacle_dist(o, c, hh) for o in obs))
+                for c2, h2 in boxes[other]:
+                    w[k]["other_fork"] = min(w[k]["other_fork"], aabb_dist(c, hh, c2, h2))
+    print("fork min clearance (m):", w)
+    return w
+
+
+def test_fork_W_clear(fork_clearance):
+    w = fork_clearance["W"]
+    assert w["panel"] > 0.01 and w["seated"] > 0.01 and w["truss"] > 0.01
+    assert w["other_fork"] > 0.1 and w["bus"] >= 0.1
+
+
+def test_fork_F_clear(fork_clearance):
+    """Fork F vs spares 1-3 (the stack does not index: it would drop spare_1 onto the returning crossbar), the truss at the slot, bay W / module_target,
+    fork W and the bus."""
+    w = fork_clearance["F"]
+    assert w["spare_1_3"] >= 0.01 and w["module_target"] > 0.1 and w["panel"] >= 0.01
+    assert w["seated"] > 0.01 and w["truss"] >= 0.01
+    assert w["other_fork"] > 0.1 and w["bus"] >= 0.1
+
+
+def test_fork_F_outside_footprint_beside_stack():
+    """Fork F arms sit outside the panel footprint in x and inside the carriage."""
+    arms = fork_geometry(cfg, "F", LAY["bay_grip_z"])[2:]
+    assert len(arms) == 2
+    for c, h in arms:
+        assert abs(c[0]) - h[0] > PANEL_HALF[0] + 0.01
+        assert abs(c[0]) + h[0] <= G["carriage_size"][0] / 2
+
+
+def test_crossbar_fits_between_spares():
+    """At the bay grip, fork F's head + crossbar sit between spare_0's knob and spare_1."""
+    tip = LAY["bay_grip_z"]
+    zmin = min(tip + o[2] - h[2] for o, h in fork_geometry(cfg, "F"))
+    spare1_front = LAY["bay_z0"] - G["stack_dz"] + PANEL_HALF[2]
+    assert zmin - spare1_front >= 0.01
+
+
+def test_stack_fixtures_clear_carriage():
+    """Top spare's grapple knob stays clear of the carriage plate."""
+    n = G["n_fresh"] - 1
+    knob = LAY["bay_z0"] - n * G["stack_dz"] - GOFF
+    assert knob - G["magazine_top_z"] >= 0.01
 
 
 def test_bridge_clears_bus(seq):
@@ -256,7 +317,7 @@ def test_mechanism_connected(seq):
         for k in range(1, G["n_fresh"]):  # the rest of the stack rides in bay F
             p = b[f"spare_{k}"][0]
             assert np.isclose(p[0], f.bridge_x["B"]) and np.isclose(p[1], b["fork_F"][0][1])
-            assert LAY["bay_z0"] - k * G["stack_dz"] - TOL <= p[2] <= LAY["bay_z0"] - (k - 1) * G["stack_dz"] + TOL
+            assert np.isclose(p[2], LAY["bay_z0"] - k * G["stack_dz"])
 
 
 def test_no_teleports(seq):
