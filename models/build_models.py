@@ -2,8 +2,20 @@
 
     python -m models.build_models          # build models/obj/ + previews
 
-Every model is written in the frame its Vizard body uses (src/viz_setup.py
-attaches each OBJ with vizSupport.createCustomModel, rotation 0):
+Every model is built in the Basilisk body frame of the Vizard body that draws
+it (listed below), then write_obj converts it to the axes Vizard 2.4 draws
+OBJ vertices in (VIZARD_FROM_BODY; src/viz_setup.py attaches each OBJ with
+vizSupport.createCustomModel, rotation 0, scale 1):
+
+  Vizard 2.4 puts an OBJ vertex o in Unity's left-handed space as-is: the
+  Dummiesman loader's (-1, 1, 1) root scale is overwritten by
+  ModelDirectoryPanelMethods.FinalizeCustomModel (localScale = scale), and
+  Unity axes are u = (b_y, b_z, -b_x) of the Basilisk body frame
+  (OrbitVectorMath.TransformFromBSKCStoUnity). So a vertex is drawn at body
+  b = (-o_z, o_x, o_y): a mirror. write_obj writes o = (b_y, b_z, -b_x)
+  (normals too) and reverses each triangle (Unity's front faces wind the
+  other way in that improper frame). Evidence: .superpowers/sdd/
+  2026-11-19-rail-gantry/vizfix-report.md.
 
   client          A axes, origin at the array center. Array plane z = 0,
                   cells on +z (sun). 59 modules (M(2,7) is its own body),
@@ -337,8 +349,20 @@ class Model:
 
 # --- writer -----------------------------------------------------------------------
 
+# Body frame -> Vizard 2.4 OBJ file axes (see the module docstring): o = M @ b,
+# M = OrbitVectorMath.TransformFromBSKCStoUnity. det(M) = -1, so write_obj also
+# reverses the triangle winding.
+VIZARD_FROM_BODY = np.array([[0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [-1.0, 0.0, 0.0]])
+
+
+def vizard_draws_at(o):
+    """Body-frame point(s) Vizard 2.4 draws OBJ file vertex(es) o at (inverse of M)."""
+    return np.asarray(o, float) @ VIZARD_FROM_BODY
+
+
 def write_obj(model, name, out):
-    """name.obj + name.mtl in out. Each group's vertices are written inside it."""
+    """name.obj + name.mtl in out. Each group's vertices are written inside it,
+    converted from the body frame to Vizard's OBJ axes (VIZARD_FROM_BODY)."""
     groups = {}
     for g, m, p in model.chunks:
         groups.setdefault(g, []).append((m, p))
@@ -350,6 +374,7 @@ def write_obj(model, name, out):
         for m, p in items:
             if not len(p.F):
                 continue
+            p = Part(p.V @ VIZARD_FROM_BODY.T, p.N @ VIZARD_FROM_BODY.T, p.UV, p.F[:, ::-1])
             # dedupe positions, UVs and normals within the chunk (shorter file)
             V, iv = np.unique(np.round(p.V, 5), axis=0, return_inverse=True)
             T, it = np.unique(np.round(p.UV, 4), axis=0, return_inverse=True)

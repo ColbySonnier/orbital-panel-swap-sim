@@ -13,11 +13,14 @@ Bodies (one Vizard model each):
   overlay_red,      module-frame outline frames (open centre) on slot M(2,7), or parked 1 km
   overlay_green     along -z_A when hidden.
 
-OBJ axes: Vizard 2.4 imports OBJ with the Dummiesman runtime OBJLoader. It
-mirrors x to convert right-handed OBJ data into Unity's left-handed space,
-the same handedness change Vizard applies to Basilisk body frames, so every
-OBJ is authored directly in its Basilisk body frame and passed with rotation
-0. MTL map_Bump becomes a tangent-space normal map and MTL `d` alpha, so
+OBJ axes: Vizard 2.4 imports OBJ with the Dummiesman runtime OBJLoader, whose
+(-1, 1, 1) root scale is overwritten by createCustomModel's scale, so a file
+vertex is used as a Unity-local point and drawn at body b = (-o_z, o_x, o_y)
+(Unity u = (b_y, b_z, -b_x)). models/build_models.write_obj therefore converts
+every model from its Basilisk body frame into those axes (VIZARD_FROM_BODY,
+winding reversed), and every model is passed with rotation 0 and scale 1.
+offset is a body-frame vector (Vizard maps it with the same u = (b_y, b_z, -b_x)).
+MTL map_Bump becomes a tangent-space normal map and MTL `d` alpha, so
 createCustomModel's normalMapPath is left empty.
 """
 from pathlib import Path

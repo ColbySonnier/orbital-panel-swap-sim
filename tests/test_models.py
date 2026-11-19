@@ -28,8 +28,9 @@ def files():
     return MODEL_FILES
 
 
-def read_obj(name):
-    """{group: (n, 3) vertex array}; a vertex belongs to the group open when written."""
+def read_obj_raw(name):
+    """{group: (n, 3) vertex array} exactly as written in the OBJ file (Vizard axes);
+    a vertex belongs to the group open when written."""
     groups, cur = {}, "default"
     for line in Path(files()[name]).read_text().splitlines():
         if line.startswith("g "):
@@ -38,6 +39,12 @@ def read_obj(name):
         elif line.startswith("v "):
             groups.setdefault(cur, []).append([float(t) for t in line.split()[1:4]])
     return {g: np.array(v).reshape(-1, 3) for g, v in groups.items() if v}
+
+
+def read_obj(name):
+    """read_obj_raw converted to the body frame: where Vizard 2.4 draws each vertex."""
+    from models.build_models import vizard_draws_at
+    return {g: vizard_draws_at(v) for g, v in read_obj_raw(name).items()}
 
 
 def all_verts(name):
@@ -107,14 +114,16 @@ def test_module_cells_on_front_and_fixture_on_back():
 
 
 def read_faces(name):
-    """(n_faces, k, 3) vertex arrays of every face (all faces in these OBJs are polygons)."""
+    """(n_faces, k, 3) body-frame vertex arrays of every face (all faces in these OBJs
+    are polygons)."""
+    from models.build_models import vizard_draws_at
     V, F = [], []
     for line in Path(files()[name]).read_text().splitlines():
         if line.startswith("v "):
             V.append([float(t) for t in line.split()[1:4]])
         elif line.startswith("f "):
             F.append([int(t.split("/")[0]) - 1 for t in line.split()[1:]])
-    V = np.array(V)
+    V = vizard_draws_at(np.array(V))
     return [V[f] for f in F]
 
 
@@ -611,3 +620,82 @@ def test_fork_heads_fill_geometry():
             inside = np.any(np.all((pts[:, None] >= parts[None, :, 0] - 1e-6) &
                                    (pts[:, None] <= parts[None, :, 1] + 1e-6), axis=2), axis=1)
             assert inside.all(), (k, c, pts[~inside][:3])
+
+
+# --- Vizard frame convention ---------------------------------------------------------
+# Evidence (vizfix-report.md in .superpowers/sdd/2026-11-19-rail-gantry/): decompiled IL of
+# Vizard 2.4's Assembly-CSharp.dll. Dummiesman.OBJLoader.Load gives the OBJ root a
+# (-1, 1, 1) localScale, but ModelDirectoryPanelMethods.FinalizeCustomModel then sets
+# localScale = (scale[1], scale[2], scale[0]) = (1, 1, 1) and localPosition =
+# (off[1], off[2], -off[0]); OrbitVectorMath.TransformFromBSKCStoUnity is
+# u = (b_y, b_z, -b_x). So an OBJ vertex o is drawn at body b = (-o_z, o_x, o_y). Writing the
+# client OBJ in body axes (the old convention) put the M(2,7) hole at A (0, 5, -5) and drew
+# the parked bridge A along z_A, matching the user's screenshots to ~10 px.
+
+def test_vizard_frame_is_the_decompiled_transform():
+    from models.build_models import VIZARD_FROM_BODY, vizard_draws_at
+    b = np.array([[1.0, 2.0, 3.0], [-4.0, 0.5, 7.0]])
+    to_unity = np.array([[x[1], x[2], -x[0]] for x in b])  # TransformFromBSKCStoUnity
+    assert np.allclose(b @ VIZARD_FROM_BODY.T, to_unity)
+    assert np.allclose(vizard_draws_at(to_unity), b)
+    assert np.linalg.det(VIZARD_FROM_BODY) == pytest.approx(-1.0)  # a mirror: winding flips
+
+
+def _drawn_A(name, origin_B, com):
+    """Where Vizard draws each group of `name`: file vertex -> body (draw map) -> A."""
+    from models.build_models import vizard_draws_at
+    return {g: vizard_draws_at(v) + origin_B + com for g, v in read_obj_raw(name).items()}
+
+
+def test_client_gap_is_where_module_target_is_drawn():
+    """The client OBJ's missing-module slot, as Vizard draws it (createCustomModel
+    offset -com, then the draw map), is exactly where the module_target body and its
+    module.obj are drawn: slot M(2,7) at A (5, -5, 0), cells toward +z_A (sun)."""
+    from src.geometry import client_mass_props, module_center
+    from src.modules.gantry_motion import GantrySequence
+    _, com, _ = client_mass_props(cfg, set())
+    s, n = cfg["client"]["slot_m"], cfg["client"]["grid"]
+    client = _drawn_A("client", -com, com)          # offset = -com_A in viz_setup
+    centers = np.array([(v.max(0) + v.min(0)) / 2 for g, v in client.items() if g.startswith("module_")])
+    assert np.allclose(centers[:, 2], 0.0, atol=0.05)  # array drawn in the z_A = 0 plane (fixture skews the box)
+    lattice = {(int(round((x + s * (n + 1) / 2) / s)), int(round((y + s * (n + 1) / 2) / s)))
+               for x, y, _ in centers}                 # (col, row)
+    bus = {(c, r) for r, c in cfg["client"]["bus_slots"]}
+    gaps = {(c, r) for r in range(1, n + 1) for c in range(1, n + 1)} - lattice - bus
+    assert len(gaps) == 1
+    (c, r), = gaps
+    gap_A = module_center(r, c, cfg)
+    p_target, R = GantrySequence(cfg).at(0.0).bodies["module_target"]
+    assert np.allclose(gap_A, p_target) and np.array_equal(R, np.eye(3))
+    assert (r, c) == tuple(cfg["client"]["target"])
+    # module.obj drawn on module_target: centered in the gap, cells (panel top) on +z_A
+    mod = _drawn_A("module", p_target - com, com)
+    v = np.vstack(list(mod.values()))
+    assert np.allclose((v.max(0) + v.min(0))[:2] / 2, gap_A[:2], atol=0.01)
+    assert abs(mod["panel"][:, 2].max() - 0.025) < 0.005
+    assert mod["fixture"][:, 2].min() < -0.05      # grapple fixture behind the array
+    # the bus is drawn behind the array (-z_A), not beside it
+    bus_c = (client["bus"].max(0) + client["bus"].min(0)) / 2
+    assert np.allclose(bus_c, [0, 0, -cfg["client"]["bus_offset_m"]], atol=0.05)
+
+
+def test_faces_front_facing_in_unity():
+    """Unity's front face is the one numeric cross(b - a, c - a) points to, in the file's
+    (left-handed Unity) axes. Every triangle's written normal must agree with it."""
+    for name in ("client", "module", "bridge", "carriage"):
+        V, N, bad, tot = [], [], 0, 0
+        for line in Path(files()[name]).read_text().splitlines():
+            if line.startswith("v "):
+                V.append([float(t) for t in line.split()[1:4]])
+            elif line.startswith("vn "):
+                N.append([float(t) for t in line.split()[1:4]])
+            elif line.startswith("f "):
+                idx = [[int(k) - 1 for k in t.split("/")] for t in line.split()[1:]]
+                a, b, c = (np.array(V[i[0]]) for i in idx[:3])
+                cr = np.cross(b - a, c - a)
+                if np.linalg.norm(cr) < 1e-10:
+                    continue
+                nrm = np.mean([N[i[2]] for i in idx], axis=0)
+                tot += 1
+                bad += cr @ nrm < 0
+        assert bad <= 0.01 * tot, (name, bad, tot)
