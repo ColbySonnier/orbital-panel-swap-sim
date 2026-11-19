@@ -31,9 +31,18 @@ Control:
 Glue contract (caller): on a "failed" event open the module switch; when
 Command.module_installed first becomes True (on entry to Checkout, once
 the swap has finished and the arm is stowed) do the power-state swap,
-monitor.reset(module) and monitor.start_checkout(...). The manager leaves
+monitor.reset(module) and monitor.start_checkout(...). While
+Command.thrusters_inhibited is True (arm linked to the client), the caller
+must hold rel_A fixed: the servicer co-moves rigidly with the client, so
+rel_A position stays constant and its velocity is zero. Only checkout
+events for cfg client.target count. The manager leaves
 Checkout only after a "checkout_pass" event, so Checkout lasts at least
 holds_s.checkout and the green overlay only appears from phase 7 on.
+On "checkout_fail" it keeps holding at berth (Command.sub "checkout_fail").
+
+Config: station exit tolerances come from cfg tolerances (pos_m, vel_mps).
+Phase timeouts come from cfg phase_timeout_s. Past a timeout the manager
+keeps flying and sets Command.sub = "timeout".
 """
 from dataclasses import dataclass, field
 
@@ -44,6 +53,8 @@ from src.modules.arm_motion import SwapSequence
 from src.modules.rel_guidance import (StraightLeg, cw_propagate,
                                       cw_relative_accel, pd_accel)
 
+PHASE_KEYS = ["monitoring", "go", "far", "inspection", "back_side", "final",
+              "exchange", "checkout", "departure", "home"]  # phase_timeout_s keys
 PHASES = ["Monitoring", "Go / no-go", "Far approach", "Inspection",
           "Move to back side", "Final approach", "Module exchange",
           "Checkout", "Departure", "Home"]
@@ -218,6 +229,10 @@ class MissionManager:
         self.v_leg, self.v_fin, self.a_leg = sp["leg_mps"], sp["final_mps"], sp["accel_mps2"]
         self.wn, self.zeta = cfg["control"]["wn"], cfg["control"]["zeta"]
         self.holds = cfg["holds_s"]
+        self.tol = {k: (float(v["pos_m"]), float(v["vel_mps"]))
+                    for k, v in cfg["tolerances"].items()}
+        self.timeouts = [cfg["phase_timeout_s"][k] for k in PHASE_KEYS]
+        self.target_id = tuple(cfg["client"]["target"])
         self.swap = geo.get("swap") or SwapSequence(cfg)
         ev = {name: float(t) for t, name in self.swap.events}
         self._inhibit = [(ev["capture"], ev["release_client"]),
@@ -231,6 +246,7 @@ class MissionManager:
         self._t_phase = 0.0
         self._svc = False
         self._pass = False
+        self._fail = False
         self._installed = False
         self._hop = None
         self._legs = None
@@ -295,8 +311,10 @@ class MissionManager:
         for e in events:
             if e.kind == "service_request":
                 self._svc = True
-            elif e.kind == "checkout_pass":
-                self._pass = True
+            elif e.kind in ("checkout_pass", "checkout_fail") \
+                    and tuple(e.module) == self.target_id:
+                self._pass |= e.kind == "checkout_pass"
+                self._fail |= e.kind == "checkout_fail"
 
         a_H = a_A = None
         inhibited, arm_t = False, None
@@ -317,7 +335,7 @@ class MissionManager:
             elif ph in (2, 3):
                 p1 = self.H["H1"] if ph == 2 else self.H["H2"]
                 hold = self.holds["H1"] if ph == 2 else self.holds["H2"]
-                tol = (5.0, 0.02) if ph == 2 else (0.5, 0.01)
+                tol = self.tol["H1"] if ph == 2 else self.tol["H2"]
                 a_H = self._hop_step(t, rel_H, p1)
                 if (self._hold_t0 is not None and t - self._hold_t0 >= hold
                         and self._settled(p1 - r, v, *tol)):
@@ -333,7 +351,7 @@ class MissionManager:
                     w3 = p0 - self.cfg["waypoints"]["W3_offset_m"] * np.array([0, 0, 1.0])
                     self._legs = _Legs(t, [p0, w3, self.H3], [self.v_leg] * 2, self.a_leg)
                 a_A = self._follow(t, rel_A, rel_H, dcm_AH, "leg")
-                if self._hold_done(t, self.holds["H3"], self.H3, rel_A, 0.2, 0.005):
+                if self._hold_done(t, self.holds["H3"], self.H3, rel_A, *self.tol["H3"]):
                     self._enter(5, t)
                     continue
             elif ph == 5:
@@ -341,7 +359,7 @@ class MissionManager:
                     self._legs = _Legs(t, [self.H3, self.P10, self.BERTH],
                                        [self.v_leg, self.v_fin], self.a_leg)
                 a_A = self._follow(t, rel_A, rel_H, dcm_AH, "leg")
-                if self._hold_done(t, self.holds["berth"], self.BERTH, rel_A, 0.05, 0.005):
+                if self._hold_done(t, self.holds["berth"], self.BERTH, rel_A, *self.tol["berth"]):
                     self._enter(6, t)
                     continue
             elif ph == 6:
@@ -360,7 +378,7 @@ class MissionManager:
                 if self._pass and t > self._t_phase:
                     self._enter(8, t)
                     continue
-                self._sub = "awaiting checkout"
+                self._sub = "checkout_fail" if self._fail else "awaiting checkout"
                 a_A = self._a_track((self.BERTH, np.zeros(3), np.zeros(3)),
                                     rel_A, rel_H, dcm_AH)
             elif ph == 8:
@@ -380,6 +398,9 @@ class MissionManager:
         else:
             F_N = self._clip(dcm_HN.T @ (self.mass * a_H))
         self._last_F = F_N
+        limit = self.timeouts[self.phase]
+        if limit is not None and t - self._t_phase > limit:
+            self._sub = "timeout"  # keep flying; Task 7 can flag it
         overlay = "green" if self._pass else ("red" if self._svc else "none")
         return Command(phase=self.phase, phase_name=PHASES[self.phase], force_N=F_N,
                        thrusters_inhibited=inhibited, arm_t=arm_t, overlay=overlay,
@@ -409,14 +430,14 @@ class MissionManager:
                                [self.v_fin, self.v_leg], self.a_leg)
         if self._dep == "out":
             a = self._follow(t, rel_A, rel_H, dcm_AH, "back out")
-            if self._legs.done(t) and self._settled(self.H3 - rel_A[:3], rel_A[3:], 0.2, 0.005):
+            if self._legs.done(t) and self._settled(self.H3 - rel_A[:3], rel_A[3:], *self.tol["H3"]):
                 self._dep = "around"
                 self._legs = self._around_legs(t, dcm_HN, dcm_AN)
                 self._hold_t0 = None
             return None, a
         if self._dep == "around":
             a = self._follow(t, rel_A, rel_H, dcm_AH, "around")
-            if self._legs.done(t) and self._settled(self._legs.end - rel_A[:3], rel_A[3:], 0.5, 0.01):
+            if self._legs.done(t) and self._settled(self._legs.end - rel_A[:3], rel_A[3:], *self.tol["H2"]):
                 self._dep = "hop H1"
                 self._hop, self._hold_t0 = _Hop(t, r, v, self.H["H1"], self.n, self.amax), None
             else:
@@ -424,7 +445,7 @@ class MissionManager:
         if self._dep == "hop H1":
             a = self._hop_step(t, rel_H, self.H["H1"])
             self._sub = "hop to H1: " + self._sub
-            if self._hold_t0 is not None and self._settled(self.H["H1"] - r, v, 5.0, 0.02):
+            if self._hold_t0 is not None and self._settled(self.H["H1"] - r, v, *self.tol["H1"]):
                 self._dep = "hop H0"
                 self._hop, self._hold_t0 = _Hop(t, r, v, self.H["H0"], self.n, self.amax), None
             else:
@@ -432,7 +453,7 @@ class MissionManager:
         if self._dep == "hop H0":
             a = self._hop_step(t, rel_H, self.H["H0"])
             self._sub = "hop to H0: " + self._sub
-            if self._hold_t0 is not None and self._settled(self.H["H0"] - r, v, 5.0, 0.02):
+            if self._hold_t0 is not None and self._settled(self.H["H0"] - r, v, *self.tol["H0"]):
                 return None
             return a, None
 

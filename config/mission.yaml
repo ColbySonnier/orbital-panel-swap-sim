@@ -75,6 +75,31 @@ holds_s:
   berth: {demo: 60, full: 300}
   checkout: {demo: 60, full: 300}
 
+# Exit tolerances for a station: position error (m) and speed (m/s).
+# H0/H1/H2 are checked in Hill; H3 and berth in the array frame A.
+# The departure's H2-equivalent uses H2.
+tolerances:
+  H0: {pos_m: 5.0, vel_mps: 0.02}
+  H1: {pos_m: 5.0, vel_mps: 0.02}
+  H2: {pos_m: 0.5, vel_mps: 0.01}
+  H3: {pos_m: 0.2, vel_mps: 0.005}
+  berth: {pos_m: 0.05, vel_mps: 0.005}
+
+# Per-phase timeouts (s), about 2x the nominal phase length; null = none.
+# On a timeout the manager keeps flying and labels Command.sub "timeout".
+# Flattened by the loader like holds_s.
+phase_timeout_s:
+  monitoring: null
+  go: {demo: 300, full: 1200}
+  far: {demo: 6000, full: 8000}
+  inspection: {demo: 6500, full: 17500}
+  back_side: {demo: 2500, full: 3500}
+  final: {demo: 1500, full: 2000}
+  exchange: {demo: 7200, full: 7200}
+  checkout: {demo: 600, full: 900}
+  departure: {demo: 15000, full: 16000}
+  home: null
+
 arm:
   links_m: [1.1, 1.1, 0.3]
   limit_deg: 170

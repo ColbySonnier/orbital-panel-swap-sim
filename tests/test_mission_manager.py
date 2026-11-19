@@ -153,6 +153,58 @@ def test_monitoring_holds_without_request():
     assert c.phase == 0 and c.overlay == "none" and norm(c.force_N) < 1e-9
 
 
+class _Ev:
+    def __init__(self, t, kind, module):
+        self.t, self.kind, self.module = t, kind, module
+
+
+def _mm_in_checkout():
+    mm = MissionManager(cfg)
+    mm._enter(7, 0.0)
+    mm._installed = True
+    return mm
+
+
+def _step(mm, t, events=()):
+    r0, v0 = orbit_rv(t)
+    dcm = hill_dcm(r0, v0)
+    rel_A = np.concatenate([mm.BERTH, np.zeros(3)])
+    return mm.update(t, np.zeros(6), rel_A, list(events), dcm, dcm)
+
+
+def test_tolerances_in_config():
+    for k in ("H0", "H1", "H2", "H3", "berth"):
+        assert set(cfg["tolerances"][k]) == {"pos_m", "vel_mps"}
+
+
+def test_phase_timeouts_flattened():
+    to = cfg["phase_timeout_s"]
+    assert to["monitoring"] is None and to["home"] is None
+    assert all(isinstance(to[k], (int, float)) for k in to if k not in ("monitoring", "home"))
+
+
+def test_checkout_pass_wrong_module_ignored():
+    mm = _mm_in_checkout()
+    _step(mm, 1.0, [_Ev(1.0, "checkout_pass", (1, 1))])
+    c = _step(mm, 2.0)
+    assert c.phase == 7 and c.overlay != "green"
+    _step(mm, 3.0, [_Ev(3.0, "checkout_pass", TARGET_ID)])
+    assert _step(mm, 4.0).phase == 8
+
+
+def test_checkout_fail_label():
+    mm = _mm_in_checkout()
+    c = _step(mm, 1.0, [_Ev(1.0, "checkout_fail", TARGET_ID)])
+    assert c.phase == 7 and c.sub == "checkout_fail"
+
+
+def test_timeout_label_keeps_flying():
+    mm = _mm_in_checkout()
+    t = cfg["phase_timeout_s"]["checkout"] + 1.0
+    c = _step(mm, t)
+    assert c.phase == 7 and c.sub == "timeout"
+
+
 # --- full mission ------------------------------------------------------------
 
 def test_phase_order(sim):
@@ -172,11 +224,18 @@ def test_red_then_green(sim):
 def test_berth_accuracy(sim):
     i = int(np.argmax(sim["phase"] == 6))
     p, v = sim["rel_A"][i, :3], sim["rel_A"][i, 3:]
-    assert norm(p - sim["wp"]["BERTH"]) < 0.05 and norm(v) < 0.005
+    tol = cfg["tolerances"]["berth"]
+    assert norm(p - sim["wp"]["BERTH"]) < tol["pos_m"] and norm(v) < tol["vel_mps"]
 
 
 def test_ends_at_h0(sim):
-    assert norm(sim["rel_H"][-1, :3] - np.array(cfg["waypoints"]["H0"])) < 5.0
+    tol = cfg["tolerances"]["H0"]
+    assert norm(sim["rel_H"][-1, :3] - np.array(cfg["waypoints"]["H0"])) < tol["pos_m"]
+    assert norm(sim["rel_H"][-1, 3:]) < tol["vel_mps"]
+
+
+def test_no_timeouts(sim):
+    assert not any(c.sub == "timeout" for c in sim["cmd"])
 
 
 def test_dv_budget(sim):
