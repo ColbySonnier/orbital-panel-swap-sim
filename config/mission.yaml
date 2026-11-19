@@ -101,6 +101,16 @@ viz:
   # face is still clearly brighter. 0.35 (free-flyer value) left the back dark.
   ambient: 0.55
   park_m: 1000             # hidden overlays park this far along -z_A from the slot
+  # Red/green slot overlay: a glowing outline frame, open centre, in the module
+  # frame (half-widths from the slot centre, z in m). back: four bars just behind
+  # the truss top grid (tube bottom -0.077) and just above fork F's crossbar at the
+  # slot (top -0.090); each bar stops `end` from the slot centre to clear the grid
+  # nodes, keel verticals and keel diagonals at the corners. front: a full rim on
+  # the sun side, 1 mm proud of the cell faces. Both stay outside the 0.985 m panel
+  # half-width, so the panels and forks pass through the open centre.
+  overlay_frame:
+    back:  {inner: 0.99, outer: 1.20, z: [-0.088, -0.083], end: 0.85}
+    front: {inner: 0.988, outer: 1.06, z: [0.026, 0.032]}
   # Client-mounted standard cameras: eye and aim point in array frame A (m).
   # Earth sits in the array plane on the -y_A side during the swap (terminator
   # orbit), so the wide view looks from behind and +y, 60 deg off the

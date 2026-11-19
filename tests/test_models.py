@@ -106,11 +106,86 @@ def test_module_cells_on_front_and_fixture_on_back():
     assert np.abs(g["fixture"][:, :2]).max() < 0.15  # centered on the back
 
 
-def test_overlays():
+def read_faces(name):
+    """(n_faces, k, 3) vertex arrays of every face (all faces in these OBJs are polygons)."""
+    V, F = [], []
+    for line in Path(files()[name]).read_text().splitlines():
+        if line.startswith("v "):
+            V.append([float(t) for t in line.split()[1:4]])
+        elif line.startswith("f "):
+            F.append([int(t.split("/")[0]) - 1 for t in line.split()[1:]])
+    V = np.array(V)
+    return [V[f] for f in F]
+
+
+def test_overlays_are_open_frames():
+    """I1: each overlay is a glowing outline frame around the slot: no face covers
+    the inner ~1.8 m square (the seated panel shows through from both sides), and
+    it has a back-side frame (behind the truss grid) and a sun-side rim."""
+    o = cfg["viz"]["overlay_frame"]
+    hole = 0.9  # half of the 1.8 m square that must stay open
     for n in ("overlay_red", "overlay_green"):
-        e = extents(n)
-        assert np.allclose(e, [2.02, 2.02, 0.01], atol=0.005)
-        assert abs(all_verts(n)[:, 2].mean() + 0.04) < 0.005
+        faces = read_faces(n)
+        assert len(faces) > 50
+        for f in faces:
+            lo, hi = f[:, :2].min(0), f[:, :2].max(0)
+            overlap = np.all(hi > -hole) and np.all(lo < hole)
+            assert not overlap, (n, lo, hi)
+        v = all_verts(n)
+        assert v[:, 2].min() == pytest.approx(o["back"]["z"][0], abs=1e-3)
+        assert v[:, 2].max() == pytest.approx(o["front"]["z"][1], abs=1e-3)
+        assert np.abs(v[:, :2]).max() == pytest.approx(max(o["back"]["outer"], o["front"]["outer"]), abs=1e-3)
+        # the rim sits outside the panel footprint, which moves along z through it
+        assert np.abs(v[:, :2]).max(1).min() >= module_visual_half() - 1e-9
+
+
+def module_visual_half():
+    from models.build_models import module_visual_m
+    return module_visual_m(cfg) / 2
+
+
+def overlay_boxes_A(name="overlay_red"):
+    """Overlay chunk AABBs placed on the target slot (A frame)."""
+    from models.build_models import builders
+    from src.geometry import module_center
+    slot = module_center(*cfg["client"]["target"], cfg)
+    return [(c + slot, h) for _, c, h in chunk_boxes(builders(cfg)[name])]
+
+
+def test_overlay_frame_clears_truss():
+    from models.build_models import truss_members
+    from src.modules.gantry_motion import seg_aabb_dist
+    worst = np.inf
+    for c, h in overlay_boxes_A():
+        for _, p0, p1, r in truss_members(cfg):  # long grid tubes span the array: no xy cull
+            worst = min(worst, seg_aabb_dist(p0, p1, c, h) - r)
+    print("overlay-truss min clearance (m):", worst)
+    assert worst >= 0.001
+
+
+def test_overlay_frame_clears_swap():
+    """No fork head, fork stage or carried panel (actual model parts) touches the
+    overlay frame at any time of the swap (1 s samples)."""
+    m = models()
+    ov = overlay_boxes_A()
+    C = np.array([c for c, _ in ov])
+    H = np.array([h for _, h in ov])
+    parts = {"fork_W": chunk_boxes(m["fork_W_head"]), "fork_F": chunk_boxes(m["fork_F_head"]),
+             "module_target": chunk_boxes(m["module"]), "spare_0": chunk_boxes(m["module"])}
+    for k in ("W", "F"):
+        for n in stage_layout(cfg, k)["names"]:
+            parts[n] = chunk_boxes(m[n])
+    worst = np.inf
+    for t in np.arange(0.0, SEQ.duration, 1.0):
+        f = SEQ.at(t)
+        for n, boxes in parts.items():
+            p = f.bodies[n][0]
+            if n in ("module_target", "spare_0") and np.allclose(p, LAY["slot_center"]):
+                continue  # a seated panel sits inside the frame by design (checked below)
+            worst = min(worst, min_box_dist(boxes, p, C, H))
+    seated = min_box_dist(parts["spare_0"], LAY["slot_center"], C, H)
+    print("overlay-swap min clearance (m):", worst, "seated panel:", seated)
+    assert worst >= 0.001 and seated >= 0.001
 
 
 def test_client_has_59_modules():  # M(2,7) is its own body

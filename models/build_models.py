@@ -11,7 +11,8 @@ attaches each OBJ with vizSupport.createCustomModel, rotation 0):
   module          A axes when seated, origin at the module center. Cells on
                   +z, grapple fixture on the -z (back) face, its tip at the
                   fork grapple point (z = -(t/2 + grapple_gap)).
-  overlay_*       module frame, a 2.02 m plate at z = -0.04 (behind the back).
+  overlay_*       module frame: a glowing outline frame around the slot with an
+                  open centre (viz.overlay_frame): back bars + sun-side rim.
   bridge          gantry bridge (A axes), origin on the rail line at the beam
                   center (x, 0, bridge_z); carbon box truss, drive trucks on
                   the client's rails (which are part of `client`).
@@ -429,9 +430,33 @@ def build_module(cfg):
     return m
 
 
-def build_overlay(color):
+def _frame_bars(inner, outer, z, end):
+    """Four bars of a square outline frame: (size, center). `end` is each bar's
+    half-length along its edge."""
+    w, c, (z0, z1) = outer - inner, (outer + inner) / 2, z
+    zc, dz = (z0 + z1) / 2, z1 - z0
+    out = []
+    for sg in (-1, 1):
+        out.append(((2 * end, w, dz), (0.0, sg * c, zc)))   # edges at y = +-c
+        out.append(((w, 2 * end, dz), (sg * c, 0.0, zc)))   # edges at x = +-c
+    return out
+
+
+def build_overlay(color, cfg):
+    """Slot overlay: a glowing outline frame (viz.overlay_frame), open centre.
+    Back bars behind the truss grid, a sun-side rim around the cell face."""
+    o = cfg["viz"]["overlay_frame"]
+    b, f = o["back"], o["front"]
     m = Model()
-    m.add("overlay", f"overlay_{color}", cbox((2.02, 2.02, 0.01), (0, 0, -0.04), 0.0, 1.0))
+    for size, ctr in _frame_bars(b["inner"], b["outer"], b["z"], b["end"]):
+        m.add("overlay_back", f"overlay_{color}", cbox(size, ctr, 0.0, 1.0))
+    # front rim: x-edge bars run the full outer length, y-edge bars fill between
+    w, c = f["outer"] - f["inner"], (f["outer"] + f["inner"]) / 2
+    zc, dz = sum(f["z"]) / 2, f["z"][1] - f["z"][0]
+    for sg in (-1, 1):
+        m.add("overlay_front", f"overlay_{color}",
+              cbox((2 * f["outer"], w, dz), (0.0, sg * c, zc), 0.0, 1.0),
+              cbox((w, 2 * f["inner"], dz), (sg * c, 0.0, zc), 0.0, 1.0))
     return m
 
 
@@ -1003,7 +1028,7 @@ def gantry_anchors(cfg):
 
 def builders(cfg):
     out = {"client": build_client(cfg), "module": build_module(cfg),
-           "overlay_red": build_overlay("red"), "overlay_green": build_overlay("green")}
+           "overlay_red": build_overlay("red", cfg), "overlay_green": build_overlay("green", cfg)}
     out.update({"bridge": build_bridge(cfg), "carriage": build_carriage(cfg),
                 "fork_W_head": build_fork_W_head(cfg), "fork_F_head": build_fork_F_head(cfg)})
     for k in ("W", "F"):

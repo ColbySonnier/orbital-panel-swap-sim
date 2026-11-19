@@ -10,7 +10,7 @@ Bodies (one Vizard model each):
   fork_*_stage1..4, Every model is built in its body frame with A axes
   module_target,    (models/build_models.py), and every gantry/panel body has
   spare_0..3        R_A = I, so no model rotation is applied.
-  overlay_red,      module-frame plates on the slot M(2,7), or parked 1 km
+  overlay_red,      module-frame outline frames (open centre) on slot M(2,7), or parked 1 km
   overlay_green     along -z_A when hidden.
 
 OBJ axes: Vizard 2.4 imports OBJ with the Dummiesman runtime OBJLoader. It
