@@ -1,0 +1,7 @@
+# Basilisk is preinstalled in the conda env: bsk==2.12.2
+numpy
+pyyaml
+matplotlib
+pytest
+trimesh
+pillow

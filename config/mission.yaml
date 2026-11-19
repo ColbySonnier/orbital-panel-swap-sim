@@ -1,0 +1,91 @@
+seed: 42
+demo_mode: true
+
+orbit:
+  alt_km: 550
+  inc_deg: 97.6
+  raan_deg: 90
+  arg_lat_deg: 0
+  epoch: "2027 MARCH 20 12:00:00.0 (UTC)"
+
+client:
+  bus_size_m: 4.0
+  bus_mass_kg: 5000
+  bus_offset_m: 4.0
+  truss_mass_kg: 400
+  module_mass_kg: 12
+  grid: 8
+  slot_m: 2.0
+  module_thick_m: 0.05
+  bus_slots: [[4, 4], [4, 5], [5, 4], [5, 5]]
+  target: [2, 7]
+  keepout_m: 15
+  cone_half_deg: 10
+  cone_len_m: 20
+
+power:
+  solar_flux: 1361
+  eff: 0.30
+  area_m2: 4.0
+  aging: 0.88
+  noise: 0.01
+  strike_t_s: 600
+  strike_frac_remaining: 0.35
+  degraded: 0.85
+  failed: 0.50
+  service: 0.70
+  persist_s: 60
+  checkout_band: [0.98, 1.20]
+
+servicer:
+  mass_kg: 250
+  inertia: [40, 40, 30]
+  size_m: [1.0, 1.0, 1.2]
+  prop_kg: 15
+  isp_s: 220
+  max_thrust_n: 2.0
+
+waypoints:
+  H0: [0, -2000, 0]
+  H1: [0, -200, 0]
+  H2: [0, -30, 0]
+  W3_offset_m: 20
+  H3_offset_m: 20
+  berth_offset_m: 2.6
+
+speeds:
+  leg_mps: 0.05
+  final_mps: 0.02
+  slow_zone_m: 10
+
+control:
+  wn: 0.02
+  zeta: 0.9
+
+# Hold durations in seconds. The loader flattens each to the active value.
+holds_s:
+  go: {demo: 60, full: 600}
+  H1: {demo: 120, full: 900}
+  H2: {demo: 300, full: 5736}
+  H3: {demo: 60, full: 600}
+  berth: {demo: 60, full: 300}
+  checkout: {demo: 60, full: 300}
+
+arm:
+  links_m: [1.1, 1.1, 0.3]
+  limit_deg: 170
+  rate_dps: 2.0
+  tip_free_mps: 0.02
+  tip_contact_mps: 0.01
+  rack_side: "+y"
+  step_min: [1, 6, 2, 3, 2, 10, 6, 10, 2, 3, 2, 6]  # 6.1-6.12
+
+viz:
+  save_file: "outputs/servicer_demo.bin"
+  rate_s: 1.0
+  ambient: 0.35
+
+dyn:
+  dt_far_s: 1.0
+  dt_near_s: 0.1
+  near_m: 200
