@@ -15,6 +15,8 @@ each OBJ with vizSupport.createCustomModel):
   arm_link_1..6   each in its own link frame from arm_motion.fk().
   tool            tool frame (origin at the tool point, +x = approach axis).
   overlay_*       module frame, a 2.02 m plate at z = -0.04 (behind the back).
+  keepout_sphere  A axes, origin at the array center: the client.keepout_m
+                  sphere, amber, semi-transparent (MTL d, see MAT_ALPHA).
 
 All geometry is procedural: real CC0 textures (ambientCG) on beveled,
 lathed and trussed parts. Textures are copied or derived next to the OBJs
@@ -35,7 +37,7 @@ OBJ_DIR = HERE / "obj"
 DL = HERE / "downloads"
 
 NAMES = ["client", "module", "servicer", *(f"arm_link_{i}" for i in range(1, 7)),
-         "tool", "overlay_red", "overlay_green"]
+         "tool", "overlay_red", "overlay_green", "keepout_sphere"]
 MODEL_FILES = {n: str(OBJ_DIR / f"{n}.obj") for n in NAMES}
 
 # --- materials ----------------------------------------------------------------
@@ -52,7 +54,9 @@ MATS = {
     "optics":      ("optics.png", None, 0.9, 200, 0.0, 0.1),
     "overlay_red":   ("overlay_red.png", None, 0.0, 1, 0.8, 1.0),
     "overlay_green": ("overlay_green.png", None, 0.0, 1, 0.8, 1.0),
+    "keepout":       ("keepout.png", None, 0.0, 1, 0.25, 4.0),
 }
+MAT_ALPHA = {"keepout": 0.15}  # MTL d; Vizard's OBJ loader renders d < 1 transparent
 CELLS_PER_TILE = 8          # SolarPanel001 has an 8 x 8 cell grid per tile
 CELL_M = 0.15               # target cell pitch on a module
 MODULE_GAP_M = 0.015        # visual gap between a module edge and its slot edge
@@ -124,6 +128,7 @@ def prepare_textures(out):
           out / "optics.png")
     for name, col in (("overlay_red", (255, 32, 24)), ("overlay_green", (40, 255, 70))):
         Image.new("RGB", (64, 64), col).save(out / f"{name}.png")
+    Image.new("RGB", (64, 64), (255, 158, 38)).save(out / "keepout.png")
 
 
 # --- mesh parts -----------------------------------------------------------------
@@ -345,7 +350,7 @@ def write_obj(model, name, out):
         tex, nrm, ks, ns, ke, _ = MATS[m]
         mtl += [f"newmtl {m}", "Ka 0.25 0.25 0.25", "Kd 1.0 1.0 1.0",
                 f"Ks {ks} {ks} {ks}", f"Ns {ns}", f"Ke {ke} {ke} {ke}" if ke else "Ke 0 0 0",
-                "d 1.0", "illum 2", f"map_Kd {tex}"]
+                f"d {MAT_ALPHA.get(m, 1.0)}", "illum 2", f"map_Kd {tex}"]
         if nrm:
             mtl.append(f"map_Bump {nrm}")
         mtl.append("")
@@ -411,6 +416,15 @@ def build_module(cfg):
 def build_overlay(color):
     m = Model()
     m.add("overlay", f"overlay_{color}", cbox((2.02, 2.02, 0.01), (0, 0, -0.04), 0.0, 1.0))
+    return m
+
+
+def build_keepout(cfg, n=48):
+    """Keep-out sphere about the array center (single-sided, outward normals)."""
+    R = cfg["client"]["keepout_m"]
+    th = np.linspace(0, np.pi, n + 1)
+    m = Model()
+    m.add("keepout", "keepout", lathe(list(zip(-R * np.cos(th), R * np.sin(th))), 4.0, 2 * n))
     return m
 
 
@@ -743,7 +757,7 @@ def build_tool(cfg):
 def builders(cfg):
     out = {"client": build_client(cfg), "module": build_module(cfg), "servicer": build_servicer(cfg),
            "tool": build_tool(cfg), "overlay_red": build_overlay("red"),
-           "overlay_green": build_overlay("green")}
+           "overlay_green": build_overlay("green"), "keepout_sphere": build_keepout(cfg)}
     for i in range(1, 7):
         out[f"arm_link_{i}"] = build_link(i, cfg)
     return out

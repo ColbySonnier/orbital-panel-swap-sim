@@ -57,7 +57,7 @@ def hill_path(log, path):
     out = np.asarray(log.phase) >= 8
     ax.plot(y[~out], x[~out], color=BLUE, label="Approach (phases 0-7)")
     ax.plot(y[out], x[out], color=ORANGE, label="Departure and home (8-9)")
-    w = log.cfg["waypoints"] if log.cfg else {"H0": [0, -2000, 0], "H1": [0, -200, 0], "H2": [0, -30, 0]}
+    w = log.cfg["waypoints"]
     for k in ("H0", "H1", "H2"):
         ax.plot(w[k][1], w[k][0], "o", ms=8, color=INK, mec=SURF, mew=2, zorder=5)
         ax.annotate(k, (w[k][1], w[k][0]), xytext=(0, 10), textcoords="offset points",
@@ -98,7 +98,7 @@ def range_speed(log, path):
 def module_ratio(log, path):
     t = log.t / 3600.0
     ids = [tuple(m) for m in log.module_ids]
-    tgt = tuple(log.cfg["client"]["target"]) if log.cfg else (2, 7)
+    tgt = tuple(log.cfg["client"]["target"])
     i = ids.index(tgt)
     R = log.module_ratios
     others = np.delete(R, i, axis=1)
@@ -106,8 +106,7 @@ def module_ratio(log, path):
     ax.fill_between(t, np.nanmin(others, 1), np.nanmax(others, 1), color="#c9c8c2",
                     lw=0, label="Other 59 modules (min to max)")
     ax.plot(t, R[:, i], color=BLUE, label="Target M({},{})".format(*tgt))
-    p = log.cfg["power"] if log.cfg else {"degraded": 0.85, "service": 0.7, "failed": 0.5,
-                                           "checkout_band": [0.98, 1.2]}
+    p = log.cfg["power"]
     for v, name in ((p["degraded"], "degraded"), (p["service"], "service"), (p["failed"], "failed")):
         ax.axhline(v, color=INK2, ls="--", lw=1)
         ax.text(0.005, v, f"{name} {v:.2f}", transform=ax.get_yaxis_transform(),
@@ -129,14 +128,15 @@ def delta_v(log, path):
     fig, ax = plt.subplots(figsize=(11, 5.5))
     _shade_phases(ax, log)
     ax.plot(t, log.dv_used, color=BLUE, label="Cumulative delta-v")
-    ax.axhline(6.0, color=INK2, ls="--", lw=1)
-    ax.text(t[0], 6.0, " budget 6 m/s", va="bottom", color=INK2, fontsize=9)
+    budget = log.cfg["budget"]["dv_mps"]
+    ax.axhline(budget, color=INK2, ls="--", lw=1)
+    ax.text(t[0], budget, f" budget {budget:g} m/s", va="bottom", color=INK2, fontsize=9)
     ax.annotate(f"{log.dv_used[-1]:.2f} m/s", (t[-1], log.dv_used[-1]), xytext=(-6, 8),
                 textcoords="offset points", ha="right", color=INK, fontweight="bold")
     ax.set_title("Servicer delta-v used")
     ax.set_xlabel("Mission time (h)")
     ax.set_ylabel("Delta-v (m/s)")
-    ax.set_ylim(0, 6.5)
+    ax.set_ylim(0, 1.08 * max(budget, log.dv_used.max()))
     _phase_key(fig)
     fig.tight_layout(rect=(0, 0.03, 1, 1))
     fig.savefig(path, dpi=150)
@@ -144,7 +144,7 @@ def delta_v(log, path):
 
 
 def make_plots(log, outdir):
-    """Write hill_path, range_speed, module_ratio and delta_v PNGs; return paths."""
+    """log.cfg is required (thresholds, waypoints, budget come from it). Write hill_path, range_speed, module_ratio and delta_v PNGs; return paths."""
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     out = []

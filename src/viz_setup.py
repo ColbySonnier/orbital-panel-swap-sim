@@ -13,7 +13,7 @@ Bodies (one Vizard model each):
                   OBJ coordinates into M: OBJ +z -> x_M).
   overlay_red,    module-frame plates, seated on M(2,7) or parked 1 km below
   overlay_green   the client.
-  keepout         a semi-transparent 15 m sphere (generated OBJ, MTL d < 1)
+  keepout         keepout_sphere.obj (models/build_models.py, MTL d < 1)
                   at the array center from inspection on, parked otherwise.
 
 OBJ axes: Vizard 2.4 imports OBJ with the Dummiesman runtime OBJLoader
@@ -31,7 +31,7 @@ import numpy as np
 from Basilisk.simulation import vizInterface
 from Basilisk.utilities import vizSupport
 
-from models.build_models import MODEL_FILES, OBJ_DIR
+from models.build_models import MODEL_FILES
 from src.geometry import client_mass_props, module_center
 from src.modules.arm_motion import _ry
 
@@ -50,31 +50,6 @@ CAMERAS = ["Wide pair view", "Servicer to client", "Arm close-up"]
 def module_dcm_NO(dcm_NS, dcm_SM):
     """Attitude (dcm_N<-OBJ) of a module body given its M frame in S."""
     return np.asarray(dcm_NS) @ np.asarray(dcm_SM) @ R_MO
-
-
-def write_keepout_obj(radius, path, n_lat=24, n_lon=48):
-    """UV sphere OBJ + MTL, amber, alpha 0.15 (MTL d), lightly emissive."""
-    path = Path(path)
-    v, f = [], []
-    for i in range(n_lat + 1):
-        th = np.pi * i / n_lat
-        for j in range(n_lon):
-            ph = 2 * np.pi * j / n_lon
-            v.append(radius * np.array([np.sin(th) * np.cos(ph), np.sin(th) * np.sin(ph), np.cos(th)]))
-    for i in range(n_lat):
-        for j in range(n_lon):
-            a, b = i * n_lon + j, i * n_lon + (j + 1) % n_lon
-            c, d = a + n_lon, b + n_lon
-            f += [(a, c, d), (a, d, b)]  # outward winding
-    lines = [f"mtllib {path.stem}.mtl", "g keepout", "usemtl keepout"]
-    lines += [f"v {p[0]:.4f} {p[1]:.4f} {p[2]:.4f}" for p in v]
-    lines += [f"vn {p[0] / radius:.4f} {p[1] / radius:.4f} {p[2] / radius:.4f}" for p in v]
-    lines += [f"f {a + 1}//{a + 1} {b + 1}//{b + 1} {c + 1}//{c + 1}" for a, b, c in f]
-    path.write_text("\n".join(lines) + "\n")
-    path.with_suffix(".mtl").write_text(
-        "newmtl keepout\nKa 0.3 0.2 0.05\nKd 1.0 0.62 0.15\nKs 0.0 0.0 0.0\n"
-        "Ns 1\nKe 0.25 0.15 0.03\nd 0.15\nillum 1\n")
-    return str(path)
 
 
 def _reset_vizsupport_lists():
@@ -122,8 +97,7 @@ def setup_viz(sim, task, client_sc, servicer_sc, extra_bodies, cfg):
         if n in extra_bodies:
             vizSupport.createCustomModel(viz, MODEL_FILES[n], simBodiesToModify=[n])
     if "keepout" in extra_bodies:
-        obj = write_keepout_obj(c["keepout_m"], OBJ_DIR / "keepout_sphere.obj")
-        vizSupport.createCustomModel(viz, obj, simBodiesToModify=["keepout"])
+        vizSupport.createCustomModel(viz, MODEL_FILES["keepout_sphere"], simBodiesToModify=["keepout"])
 
     # --- approach cone: tip at M(2,7), axis -z_A, on the client body ----------
     tip_B = module_center(*c["target"], cfg) - com

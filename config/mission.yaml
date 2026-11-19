@@ -124,8 +124,20 @@ viz:
   save_file: "outputs/servicer_demo.bin"
   rate_s: 1.0
   ambient: 0.35
+  park_m: 1000             # hidden bodies park this far radially below the client
+  blend_s: 180             # servicer attitude blend, camera-at-client <-> berth
 
 dyn:
   dt_far_s: 1.0
   dt_near_s: 0.1
   near_m: 200
+  far_hysteresis: 1.25     # back to dt_far above far_hysteresis * near_m
+  fsw_s: 0.5               # FSW task period (glue acts every max(fsw_s, dt))
+
+run:
+  chunk_s: 10              # outer loop step: dt switching and stop check
+  home_tail_s: 600         # keep flying this long after reaching Home
+  t_max_s: 60000           # hard stop
+
+budget:
+  dv_mps: 6.0

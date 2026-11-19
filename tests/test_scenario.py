@@ -19,13 +19,14 @@ cfg = load_config()
 
 
 @pytest.fixture(scope="module")
-def log():
-    return run(load_config(), viz=False)
+def log(tmp_path_factory):
+    return run(load_config(), viz=False, outdir=tmp_path_factory.mktemp("noviz"))
 
 
 @pytest.fixture(scope="module")
-def viz_log():
-    return run(load_config(), viz=True)
+def viz_log(tmp_path_factory):
+    """Replay goes to a temp folder (never overwrites outputs/)."""
+    return run(load_config(), viz=True, outdir=tmp_path_factory.mktemp("viz"))
 
 
 # --- fast frame checks ---------------------------------------------------------
@@ -62,11 +63,12 @@ def test_phase_order(log):
 
 
 def test_power_restored(log):
-    assert log.array_power[-1] >= 0.99 * log.array_power[log.t < 600].mean()
+    pre = log.t < cfg["power"]["strike_t_s"]
+    assert log.array_power[-1] >= 0.99 * log.array_power[pre].mean()
 
 
 def test_dv_budget(log):
-    assert log.dv_used[-1] <= 6.0
+    assert log.dv_used[-1] <= cfg["budget"]["dv_mps"]
 
 
 def test_no_timeouts(log):
@@ -84,13 +86,14 @@ def test_plots_written(log, tmp_path):
 
 @pytest.mark.slow
 def test_viz_file_small(viz_log):
-    f = REPO / cfg["viz"]["save_file"]
-    assert 0 < Path(f).stat().st_size < 300e6
+    f = viz_log.replay
+    assert f.name == Path(cfg["viz"]["save_file"]).name and REPO / "outputs" not in f.parents
+    assert 0 < f.stat().st_size < 300e6
 
 
 @pytest.mark.slow
 def test_ambient_applied(viz_log):
-    assert viz_log.viz.settings.ambient == cfg["viz"]["ambient"]
+    assert viz_log.viz_settings["ambient"] == cfg["viz"]["ambient"]
 
 
 def test_corridor(log):

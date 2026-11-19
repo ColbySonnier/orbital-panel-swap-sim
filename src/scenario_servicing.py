@@ -6,8 +6,8 @@ Tasks (one process; at equal times, higher priority runs first):
   env      1 s     SPICE (Earth, Sun; zero base Earth)
   dynFar   1 s  \  client + servicer (Earth + Sun point-mass gravity) and the
   dynNear  0.1 s/  servicer's extForceTorque. Exactly one is enabled: near
-                   below dyn.near_m, far again above 1.25 x near_m.
-  fsw      0.5 s   eclipse, then Glue: frames, power + health monitor,
+                   below dyn.near_m, far again above far_hysteresis x near_m.
+  fsw      dyn.fsw_s  eclipse, then Glue: frames, power + health monitor,
                    MissionManager, force command, attitudes, rigid link, mass.
   viz      viz.rate_s  BodyWriter (extra-body states + HUD), then vizInterface.
 
@@ -15,6 +15,7 @@ Frames: A is inertial (the client body frame, set from the Sun direction at
 t = 0 with geometry.array_dcm and held); H is Hill about the client CoM.
 """
 import argparse
+import gc
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,17 +36,11 @@ from src.modules.mission_manager import PHASES, MissionManager
 from src.viz_setup import module_dcm_NO
 
 REPO = Path(__file__).resolve().parents[1]
-CHUNK_S = 10.0          # outer-loop step: dt switching and the stop check
-BLEND_S = 180.0         # servicer attitude blend between point and berth modes
-PARK_M = 1000.0         # hidden bodies sit this far below the client
-HOME_TAIL_S = 600.0
-FSW_S = 0.5     # keep flying this long after reaching Home
-T_MAX_S = 60000.0
 
 
 @dataclass
 class RunLog:
-    """Time series at the FSW rate (0.5 s)."""
+    """Time series, one row per glue update (every max(dyn.fsw_s, dyn dt))."""
     t: np.ndarray
     rel_H: np.ndarray          # (N, 6) servicer rel. client CoM, Hill
     rel_A: np.ndarray          # (N, 6) servicer rel. array center, A
@@ -61,7 +56,7 @@ class RunLog:
     phase_start: dict          # phase -> first sim time (s)
     mass: np.ndarray           # servicer hub mass (kg)
     cfg: dict = field(repr=False, default=None)
-    viz: object = field(repr=False, default=None)
+    viz_settings: dict = field(default_factory=dict)  # snapshot; the viz module is released
     wall_s: float = 0.0
     replay: Path | None = None
 
@@ -115,7 +110,9 @@ class Glue(sysModel.SysModel):
         self.L = {k: [] for k in ("t", "rel_H", "rel_A", "phase", "dv", "power", "ratios",
                                   "q", "sub", "overlay", "mass")}
         self.events = []
-        self.period_ns = macros.sec2nano(FSW_S)  # set by run() to max(FSW_S, dyn dt)
+        self.fsw_s = float(cfg["dyn"]["fsw_s"])
+        self.blend_s = float(cfg["viz"]["blend_s"])
+        self.period_ns = macros.sec2nano(self.fsw_s)  # run() sets max(fsw_s, dyn dt)
         self._pos = None  # servicer state objects exist only after init
 
     def _bind_states(self):
@@ -150,11 +147,11 @@ class Glue(sysModel.SysModel):
         mode = "berth" if (4 <= cmd.phase <= 7 or (cmd.phase == 8 and cmd.frame == "A")) else "point"
         a = self._att
         if a["mode"] is None:
-            a["mode"], a["t0"], a["start"] = mode, -BLEND_S, self.dcm_SN
+            a["mode"], a["t0"], a["start"] = mode, -self.blend_s, self.dcm_SN
         elif mode != a["mode"]:
             a["mode"], a["t0"], a["start"] = mode, t, self.dcm_SN.copy()
         tgt = self._target_dcm_SN(mode, r_c, v_c, r_s)
-        s = _smooth((t - a["t0"]) / BLEND_S)
+        s = _smooth((t - a["t0"]) / self.blend_s)
         if s >= 1.0:
             dcm = tgt
         else:
@@ -319,7 +316,7 @@ class BodyWriter(sysModel.SysModel):
                 self._write(name, seat_r, dcm_NA, v_c, t_ns)
             else:
                 self._write(name, r_s + dcm_NS @ c_S, module_dcm_NO(dcm_NS, dcm_SM), v_s, t_ns)
-        park = r_c - PARK_M * r_c / np.linalg.norm(r_c)
+        park = r_c - self.cfg["viz"]["park_m"] * r_c / np.linalg.norm(r_c)
         for color in ("red", "green"):
             on = cmd.overlay == color
             self._write(f"overlay_{color}", seat_r if on else park, dcm_NA, v_c, t_ns)
@@ -378,7 +375,7 @@ def build(cfg, viz=True):
     proc.addTask(sim.CreateNewTask("env", macros.sec2nano(1.0)), 400)
     proc.addTask(sim.CreateNewTask("dynFar", macros.sec2nano(dyn["dt_far_s"])), 300)
     proc.addTask(sim.CreateNewTask("dynNear", macros.sec2nano(dyn["dt_near_s"])), 300)
-    proc.addTask(sim.CreateNewTask("fsw", macros.sec2nano(FSW_S)), 200)
+    proc.addTask(sim.CreateNewTask("fsw", macros.sec2nano(dyn["fsw_s"])), 200)
     proc.addTask(sim.CreateNewTask("viz", macros.sec2nano(cfg["viz"]["rate_s"])), 100)
 
     grav = simIncludeGravBody.gravBodyFactory()
@@ -433,7 +430,7 @@ def build(cfg, viz=True):
         from src.viz_setup import EXTRA_BODIES, hud_dialog, setup_viz
         msgs = {n: messaging.SCStatesMsg() for n in EXTRA_BODIES}
         p0 = messaging.SCStatesMsgPayload()
-        p0.r_BN_N = list(r_c - PARK_M * r_c / np.linalg.norm(r_c))
+        p0.r_BN_N = list(r_c - cfg["viz"]["park_m"] * r_c / np.linalg.norm(r_c))
         for m in msgs.values():  # valid states before the first writer call
             m.write(p0, 0)
         v = setup_viz(sim, "viz", client, servicer, msgs, cfg)
@@ -455,34 +452,34 @@ def run(cfg=None, viz=True, outdir=REPO / "outputs", verbose=False):
         cfg = dict(cfg, viz=dict(cfg["viz"], save_file=str(outdir / Path(cfg["viz"]["save_file"]).name)))
     P = build(cfg, viz=viz)
     sim, glue = P["sim"], P["glue"]
-    near_m = cfg["dyn"]["near_m"]
+    dyn, rc = cfg["dyn"], cfg["run"]
+    near_m, far_m = dyn["near_m"], dyn["far_hysteresis"] * dyn["near_m"]
+    dts = {False: dyn["dt_far_s"], True: dyn["dt_near_s"]}
     near = False
-    dts = {False: cfg["dyn"]["dt_far_s"], True: cfg["dyn"]["dt_near_s"]}
+
+    def set_rate(is_near):
+        sim.disableTask("dynFar" if is_near else "dynNear")
+        sim.enableTask("dynNear" if is_near else "dynFar")
+        glue.period_ns = macros.sec2nano(max(dyn["fsw_s"], dts[is_near]))
+
     sim.disableTask("dynNear")
-    glue.period_ns = macros.sec2nano(max(FSW_S, dts[near]))
+    glue.period_ns = macros.sec2nano(max(dyn["fsw_s"], dts[near]))
     sim.InitializeSimulation()
     t = 0.0
     last_phase = None
-    while t < T_MAX_S:
-        t += CHUNK_S
+    while t < rc["t_max_s"]:
+        t += rc["chunk_s"]
         sim.ConfigureStopTime(macros.sec2nano(t))
         sim.ExecuteSimulation()
         r = glue.range
-        if not near and r is not None and r < near_m:
-            near = True
-            sim.disableTask("dynFar")
-            sim.enableTask("dynNear")
-            glue.period_ns = macros.sec2nano(max(FSW_S, dts[near]))
-        elif near and r is not None and r > 1.25 * near_m:
-            near = False
-            sim.disableTask("dynNear")
-            sim.enableTask("dynFar")
-            glue.period_ns = macros.sec2nano(max(FSW_S, dts[near]))
+        if r is not None and (r < near_m) != near and (not near or r > far_m):
+            near = not near
+            set_rate(near)
         if verbose and glue.cmd is not None and glue.cmd.phase != last_phase:
             last_phase = glue.cmd.phase
             print(f"  t={t:8.0f} s  phase {last_phase} {PHASES[last_phase]}"
                   f"  range {r:8.1f} m  wall {time.time() - wall0:6.1f} s", flush=True)
-        if glue.home_t is not None and t - glue.home_t >= HOME_TAIL_S:
+        if glue.home_t is not None and t - glue.home_t >= rc["home_tail_s"]:
             break
     P["grav"].unloadSpiceKernels()
     L = glue.L
@@ -492,11 +489,17 @@ def run(cfg=None, viz=True, outdir=REPO / "outputs", verbose=False):
         array_power=np.array(L["power"]), module_ratios=np.array(L["ratios"]),
         module_ids=glue.ids, arm_q=np.array(L["q"]), sub=L["sub"], overlay=L["overlay"],
         events=glue.events, phase_start=dict(glue.phase_start), mass=np.array(L["mass"]),
-        cfg=cfg, viz=P["viz"])
+        cfg=cfg)
     if viz:
         vm = P["viz"]
         log.replay = Path(vm.protoFilename)
-        del P, sim  # closes the replay file
+        log.viz_settings = {"ambient": vm.settings.ambient}
+        del vm
+    # Drop every reference to the sim and vizInterface: its destructor closes
+    # (and flushes) the replay stream before anyone measures the file.
+    P.clear()
+    del sim, glue, P
+    gc.collect()
     log.wall_s = time.time() - wall0
     return log
 
@@ -506,7 +509,7 @@ def summary(log):
              f"sim time        {log.t[-1]:8.0f} s",
              f"final phase     {log.phase[-1]} ({PHASES[log.phase[-1]]})",
              f"delta-v used    {log.dv_used[-1]:8.3f} m/s",
-             f"power restored  {100 * log.array_power[-1] / log.array_power[log.t < 600].mean():8.2f} % of pre-fault"]
+             f"power restored  {100 * log.array_power[-1] / log.array_power[log.t < log.cfg["power"]["strike_t_s"]].mean():8.2f} % of pre-fault"]
     if log.replay is not None and log.replay.exists():
         lines.append(f"replay          {log.replay} ({log.replay.stat().st_size / 1e6:.1f} MB)")
     lines.append("phase starts (sim s):")
@@ -519,11 +522,12 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--full-timeline", action="store_true", help="real ConOps holds")
     ap.add_argument("--no-viz", action="store_true", help="skip the Vizard replay")
+    ap.add_argument("--outdir", default=str(REPO / "outputs"), help="replay + plots folder")
     a = ap.parse_args(argv)
     from src.plots import make_plots
     cfg = load_config(full_timeline=a.full_timeline)
-    log = run(cfg, viz=not a.no_viz, verbose=True)
-    paths = make_plots(log, REPO / "outputs")
+    log = run(cfg, viz=not a.no_viz, outdir=a.outdir, verbose=True)
+    paths = make_plots(log, a.outdir)
     print(summary(log))
     print("plots:", *(str(p) for p in paths), sep="\n  ")
 

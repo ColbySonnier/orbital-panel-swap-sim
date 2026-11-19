@@ -10,7 +10,7 @@ from src.config import load_config
 cfg = load_config()
 ROOT = Path(__file__).resolve().parents[1]
 MODELS = ROOT / "models"
-KEYS = {"client", "module", "servicer", "tool", "overlay_red", "overlay_green",
+KEYS = {"client", "module", "servicer", "tool", "overlay_red", "overlay_green", "keepout_sphere",
         *(f"arm_link_{i}" for i in range(1, 7))}
 
 
