@@ -1,0 +1,7 @@
+.superpowers/
+__pycache__/
+*.pyc
+.pytest_cache/
+models/obj/
+models/downloads/
+outputs/
