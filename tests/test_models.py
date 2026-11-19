@@ -10,8 +10,13 @@ from src.config import load_config
 cfg = load_config()
 ROOT = Path(__file__).resolve().parents[1]
 MODELS = ROOT / "models"
+G = cfg["gantry"]
+N_STAGES = {k: len(G[f"fork_{k}_stages"]) for k in ("W", "F")}
+GANTRY_KEYS = {"bridge", "carriage", "fork_W_head", "fork_F_head",
+               *(f"fork_{k}_stage{i}" for k in ("W", "F") for i in range(1, N_STAGES[k] + 1))}
+# servicer / arm / keep-out stay until task G3 removes them
 KEYS = {"client", "module", "servicer", "tool", "overlay_red", "overlay_green", "keepout_sphere",
-        *(f"arm_link_{i}" for i in range(1, 7))}
+        *(f"arm_link_{i}" for i in range(1, 7)), *GANTRY_KEYS}
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -270,3 +275,303 @@ def test_truss_clears_carried_modules():
             assert gap.min() > 0.0005, (f.step, t, body, gap.min())
         checked[f.step] += 1
     assert min(checked.values()) > 50
+
+
+# --- gantry models (task G2) --------------------------------------------------------
+
+from src.modules.gantry_motion import (GantrySequence, aabb_dist, body_half,  # noqa: E402
+                                       fork_geometry, gantry_layout, stage_layout)
+
+LAY = gantry_layout(cfg)
+BRIDGE_HALF = body_half(cfg)["bridge_A"]
+SEQ = GantrySequence(cfg, bridge="B")
+TS = np.linspace(0.0, SEQ.duration, 61)
+
+
+def models():
+    from models.build_models import builders
+    if not hasattr(models, "m"):
+        models.m = builders(cfg)
+    return models.m
+
+
+def anchors():
+    from models.build_models import gantry_anchors
+    return gantry_anchors(cfg)
+
+
+def chunk_boxes(model, groups=None, skip=()):
+    """[(group, center, half)] AABB per chunk (all gantry bodies use dcm = I)."""
+    out = []
+    for g, _, p in model.chunks:
+        if not len(p.F) or (groups and g not in groups) or g in skip:
+            continue
+        lo, hi = p.V.min(0), p.V.max(0)
+        out.append((g, (lo + hi) / 2, (hi - lo) / 2))
+    return out
+
+
+def group_box(model, group):
+    V = np.vstack([p.V for g, _, p in model.chunks if g == group and len(p.F)])
+    return V.min(0), V.max(0)
+
+
+def min_box_dist(boxes, offset, C, H):
+    """Min surface distance between boxes [(g, c, h)] shifted by offset and boxes (C, H)."""
+    c = np.array([b[1] for b in boxes]) + offset
+    h = np.array([b[2] for b in boxes])
+    gap = np.maximum(0.0, np.abs(c[:, None] - C[None]) - h[:, None] - H[None])
+    return float(np.sqrt((gap ** 2).sum(-1)).min())
+
+
+def test_gantry_models_connected():
+    """Every gantry model is one touching assembly (F stages: each arm on its own)."""
+    m = models()
+    for n in ("bridge", "carriage", "fork_W_head", "fork_F_head",
+              *(f"fork_W_stage{i}" for i in range(1, N_STAGES["W"] + 1))):
+        assert _connected(m[n], tol=2e-3), n
+    from models.build_models import Model
+    for i in range(1, N_STAGES["F"] + 1):
+        for sx in (-1, 1):
+            half = Model()
+            half.chunks = [c for c in m[f"fork_F_stage{i}"].chunks if np.sign(c[2].V[:, 0].mean()) == sx]
+            assert half.chunks and _connected(half, tol=2e-3), (i, sx)
+
+
+def test_rails_in_client():
+    g = read_obj("client")
+    for name, sy in (("rail_p", 1), ("rail_n", -1)):
+        v = g[name]
+        mid = (v.max(0) + v.min(0)) / 2
+        assert abs(mid[1] - sy * LAY["rail_y"]) < 0.01 and abs(mid[2] - LAY["rail_z"]) < 0.01
+        # rail covers both bridges' travel, trucks included
+        assert v[:, 0].min() < min(G["park_x"].values()) - 0.4
+        assert v[:, 0].max() > max(G["park_x"].values()) + 0.4
+    assert "rail_supports" in g
+
+
+def test_rails_supported_by_truss():
+    """Rails + supports + truss form one connected structure (nothing floats)."""
+    from models.build_models import Model
+    c = models()["client"]
+    sub = Model()
+    sub.chunks = [ch for ch in c.chunks if ch[0] in ("rail_p", "rail_n", "rail_supports", "truss", "truss_nodes")]
+    assert _connected(sub, tol=2e-3)
+
+
+def test_bridge_spans_rails():
+    from models.build_models import RAIL_H
+    b = models()["bridge"]
+    lo, hi = group_box(b, "beam")
+    assert np.allclose(hi[[0, 2]], BRIDGE_HALF[[0, 2]], atol=0.005)   # beam = G1 bridge section
+    assert np.allclose(lo[[0, 2]], -BRIDGE_HALF[[0, 2]], atol=0.005)
+    top = np.array(anchors()["bridge"]["wheel_top"])
+    assert len(top) >= 4
+    for sy in (1, -1):
+        w = top[np.sign(top[:, 1]) == sy]
+        assert len(w) >= 2
+        assert np.allclose(w[:, 1], sy * LAY["rail_y"], atol=0.02)   # trucks on the rails (brief: 2 cm)
+        assert np.allclose(w[:, 2], RAIL_H / 2, atol=1e-6)
+    v = all_verts("bridge")
+    assert v[:, 1].max() >= LAY["rail_y"] and v[:, 1].min() <= -LAY["rail_y"]
+
+
+def test_trucks_ride_on_rails():
+    """Review Focus 2: both bridges' wheel contacts lie on the client rail surfaces at all times."""
+    g = read_obj("client")
+    rails = {1: g["rail_p"], -1: g["rail_n"]}
+    a = anchors()["bridge"]
+    for t in TS:
+        f = SEQ.at(t)
+        for n in ("bridge_A", "bridge_B"):
+            p = f.bodies[n][0]
+            for key, face in (("wheel_top", 1), ("wheel_bottom", -1)):
+                for q in np.array(a[key]) + p:
+                    r = rails[int(np.sign(q[1]))]
+                    assert r[:, 0].min() <= q[0] <= r[:, 0].max()
+                    assert r[:, 1].min() <= q[1] <= r[:, 1].max()
+                    zf = r[:, 2].max() if face > 0 else r[:, 2].min()
+                    assert abs(q[2] - zf) < 1e-3, (t, n, key, q, zf)
+            for q in np.array(a["wheel_side"]) + p:           # guide wheels on the inner face
+                r = rails[int(np.sign(q[1]))]
+                inner = np.abs(r[:, 1]).min()
+                assert abs(abs(q[1]) - inner) < 1e-3
+                assert r[:, 2].min() <= q[2] <= r[:, 2].max()
+
+
+def test_carriage_rides_bridge():
+    """Review Focus 2: carriage plate sits on the bridge beam; rollers touch the beam sides."""
+    m = models()
+    blo, bhi = group_box(m["bridge"], "beam")
+    plo, phi = group_box(m["carriage"], "plate")
+    a = anchors()["carriage"]
+    assert abs(phi[2] - (G["magazine_top_z"] - LAY["carriage_z"])) < 1e-3   # +z face = magazine_top_z
+    assert abs(plo[2] - (G["bridge_z"] - LAY["carriage_z"])) < 1e-3          # back face = bridge_z
+    for t in TS:
+        f = SEQ.at(t)
+        bp, cp = f.bodies["bridge_B"][0], f.bodies["carriage"][0]
+        d = aabb_dist((plo + phi) / 2 + cp, (phi - plo) / 2, (blo + bhi) / 2 + bp, (bhi - blo) / 2)
+        assert d < 1e-3, (t, d)
+        for q in np.array(a["roller"]) + cp - bp:                # in bridge-local coordinates
+            assert abs(abs(q[0]) - bhi[0]) < 1e-3
+            assert blo[1] <= q[1] <= bhi[1] and blo[2] <= q[2] <= bhi[2]
+        for q in np.array(a["pad"]) + cp - bp:
+            assert abs(q[2] - bhi[2]) < 1e-3 and abs(q[0]) <= bhi[0] and blo[1] <= q[1] <= bhi[1]
+
+
+def test_carriage_parts_clear_beam():
+    """No carriage part cuts into the bridge beam (pads and rollers may touch it)."""
+    m = models()
+    blo, bhi = group_box(m["bridge"], "beam")
+    dz = np.array([0.0, 0.0, LAY["carriage_z"] - G["bridge_z"]])   # carriage -> bridge frame
+    for g, c, h in chunk_boxes(m["carriage"]):
+        pen = np.minimum(c + dz + h, bhi) - np.maximum(c + dz - h, blo)
+        assert pen.min() <= 1e-3, (g, c, h)
+
+
+def test_magazine_bays_match_config():
+    m = models()
+    a = anchors()["carriage"]
+    hp = G["bay_pitch"] / 2
+    assert np.isclose(a["bay_y"]["W"], G["waste_side"] * hp) and np.isclose(a["bay_y"]["F"], -G["waste_side"] * hp)
+    assert np.isclose(a["bay_y"]["F"] - a["bay_y"]["W"], -G["waste_side"] * G["bay_pitch"])
+    from models.build_models import module_visual_m
+    ph = module_visual_m(cfg) / 2
+    guides = chunk_boxes(m["carriage"], groups={"guides"})
+    assert len(guides) >= 8
+    for bay in ("W", "F"):
+        c = np.array([0, a["bay_y"][bay], 0])
+        near = [aabb_dist(gc, gh, c, [ph, ph, 1.0]) for _, gc, gh in guides
+                if abs(gc[1] - c[1]) < ph + 0.1]
+        assert len(near) >= 4 and min(near) >= 0.005 and max(near) <= 0.03, bay
+    # side frames reach past the front of the bottom stack panel: the stack sits in the carriage
+    fz = max(c[2] + h[2] for _, c, h in chunk_boxes(m["carriage"], groups={"frame", "guides"}))
+    front = G["bay_z0"] + cfg["client"]["module_thick_m"] / 2 - LAY["carriage_z"]
+    assert fz >= front + 0.05
+
+
+def test_stages_meet_carriage_and_head():
+    """Review Focus 2: stage 1 on the carriage mount, neighbours overlap, last stage in its head."""
+    m = models()
+    a = anchors()["carriage"]
+    mounts = {"W": np.array(a["mount_W"]), "F": np.array(a["mount_F"])}
+    for k in ("W", "F"):
+        st = stage_layout(cfg, k)
+        hlo, hhi = (np.min([p.V.min(0) for _, _, p in m[f"fork_{k}_head"].chunks], 0),
+                    np.max([p.V.max(0) for _, _, p in m[f"fork_{k}_head"].chunks], 0))
+        boxes = []
+        for n in st["names"]:
+            v = np.vstack([p.V for _, _, p in m[n].chunks])
+            lo, hi = v.min(0), v.max(0)
+            assert abs((hi - lo)[2] - st["length"]) < 2e-3 and abs(hi[2]) < 1e-3, n
+            boxes.append((lo, hi))
+        for t in TS:
+            f = SEQ.at(t)
+            cp = f.bodies["carriage"][0]
+            tip = f.bodies[f"fork_{k}"][0]
+            iv = [(lo + f.bodies[n][0], hi + f.bodies[n][0]) for n, (lo, hi) in zip(st["names"], boxes)]
+            tops = [np.array([x, iv[0][0][1] * 0 + tip[1], iv[0][0][2]]) for x in tip[0] + np.array(st["x"])]
+            for q in tops:                                       # stage 1 top on a carriage mount
+                assert np.min(np.linalg.norm(mounts[k] + cp - q, axis=1)) < 1e-3, (t, k, q)
+            for (lo0, hi0), (lo1, hi1) in zip(iv, iv[1:]):
+                assert min(hi0[2], hi1[2]) - max(lo0[2], lo1[2]) >= G["stage_overlap_m"] - 2e-3
+                assert np.all(lo1[:2] >= lo0[:2] - 1e-9) and np.all(hi1[:2] <= hi0[:2] + 1e-9)  # nested
+            z_end = iv[-1][1][2]
+            assert hlo[2] + tip[2] <= z_end <= hhi[2] + tip[2], (t, k)   # last stage ends in the head
+            assert min(lo[2] for lo, _ in iv) >= G["magazine_top_z"] - 1e-3
+
+
+def test_fork_heads_match_geometry():
+    """Head models fill fork_geometry's head / crossbar boxes and stay inside the fork envelope (5 mm)."""
+    m = models()
+    tol = 0.005
+    for k in ("W", "F"):
+        V = np.vstack([p.V for _, _, p in m[f"fork_{k}_head"].chunks])
+        lo, hi = V.min(0), V.max(0)
+        heads = fork_geometry(cfg, k)
+        for c, h in heads:
+            assert np.all(lo <= c - h + tol) and np.all(hi >= c + h - tol), (k, c, h)
+        env = fork_geometry(cfg, k, LAY["bay_grip_z"])
+        inside = np.zeros(len(V), bool)
+        for c, h in env:
+            inside |= np.all(np.abs(V - c) <= h + tol, axis=1)
+        assert inside.all(), (k, V[~inside][:5])
+
+
+def test_carriage_clears_moving_panels_and_forks():
+    """Magazine frame and guides clear every panel and fork box over the sequence."""
+    m = models()
+    frame = chunk_boxes(m["carriage"], groups={"frame", "guides"})
+    from src.modules.gantry_motion import stage_boxes
+    ph = body_half(cfg)["spare_0"]
+    worst = np.inf
+    for t in TS:
+        f = SEQ.at(t)
+        cp = f.bodies["carriage"][0]
+        boxes = [(f.bodies[n][0], ph) for n in ["module_target"] + [f"spare_{i}" for i in range(G["n_fresh"])]]
+        for k in ("W", "F"):
+            tip = f.bodies[f"fork_{k}"][0]
+            boxes += [(tip + o, h) for o, h in fork_geometry(cfg, k)]
+            for n, bx in stage_boxes(cfg, k).items():
+                boxes += [(f.bodies[n][0] + o, h) for o, h in bx]
+        for _, c, h in frame:
+            for bc, bh in boxes:
+                worst = min(worst, aabb_dist(c + cp, h, bc, bh))
+    print("carriage frame min clearance (m):", worst)
+    assert worst >= 0.005
+
+
+def test_gantry_models_clear_client():
+    """Bridge and carriage models clear the bus (>= 0.1 m), the truss and the rail supports."""
+    from tests.test_gantry_motion import bus_obstacles, obstacle_dist, truss_clearance
+    m = models()
+    obs = bus_obstacles(cfg)
+    sup = chunk_boxes(m["client"], groups={"rail_supports"})
+    sup_c, sup_h = np.array([b[1] for b in sup]), np.array([b[2] for b in sup])
+    chunks = {n: chunk_boxes(m[n]) for n in ("bridge", "carriage")}
+    parts = {}
+    for name in ("bridge", "carriage"):    # one AABB per group (conservative, and fast)
+        parts[name] = []
+        for grp in {g for g, _, _ in m[name].chunks}:
+            lo, hi = group_box(m[name], grp)
+            parts[name].append((grp, (lo + hi) / 2, (hi - lo) / 2))
+    worst = {"bus": np.inf, "truss": np.inf, "supports": np.inf}
+    for t in TS[::3]:
+        f = SEQ.at(t)
+        poses = [("bridge", f.bodies["bridge_A"][0]), ("bridge", f.bodies["bridge_B"][0]),
+                 ("carriage", f.bodies["carriage"][0])]
+        for name, p in poses:
+            for _, c, h in parts[name]:
+                worst["bus"] = min(worst["bus"], min(obstacle_dist(o, c + p, h) for o in obs))
+                worst["truss"] = min(worst["truss"], truss_clearance(c + p, h))
+        for name, p in poses:                    # supports vs every chunk (the trucks pass close by)
+            worst["supports"] = min(worst["supports"], min_box_dist(chunks[name], p, sup_c, sup_h))
+    print("gantry model clearance (m):", worst)
+    assert worst["bus"] >= 0.1 and worst["truss"] >= 0.01 and worst["supports"] >= 0.01
+
+
+def test_anchors_on_geometry():
+    """The exported anchors are real contact points of the built meshes, not just numbers."""
+    m = models()
+    a = anchors()
+
+    def line_contact(model, groups, q, axis, tol=1e-3):
+        """A tread line along `axis` passes through q: vertices match q off-axis and straddle it."""
+        V = np.vstack([p.V for g, _, p in model.chunks if g in groups])
+        off = [i for i in range(3) if i != axis]
+        on = V[np.all(np.abs(V[:, off] - q[off]) < tol, axis=1), axis]
+        return len(on) > 0 and on.min() < q[axis] < on.max()
+
+    for key, ax in (("wheel_top", 1), ("wheel_bottom", 1), ("wheel_side", 2)):
+        for q in a["bridge"][key]:
+            assert line_contact(m["bridge"], {"wheels"}, np.array(q), ax), (key, q)
+    for q in a["carriage"]["roller"]:
+        assert line_contact(m["carriage"], {"rollers", "drives"}, np.array(q), 2), q
+    decks = chunk_boxes(m["carriage"], groups={"deck"})
+    for q in np.array(a["carriage"]["pad"]):   # on the underside of a deck plate
+        assert any(np.all(np.abs(q[:2] - c[:2]) <= h[:2]) and abs(c[2] - h[2] - q[2]) < 1e-3 for _, c, h in decks), q
+    for k in ("W", "F"):                        # each mount surrounds its stage-1 top
+        mounts = chunk_boxes(m["carriage"], groups={f"mount_{k}"})
+        for q in np.array(a["carriage"][f"mount_{k}"]):
+            d = [aabb_dist(c, h, q, np.zeros(3)) for _, c, h in mounts]
+            assert sum(x < 0.15 for x in d) >= 3, (k, q)

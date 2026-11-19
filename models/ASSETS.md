@@ -44,6 +44,20 @@ Source pages:
 - Canadarm: https://github.com/nasa/NASA-3D-Resources/tree/master/3D%20Models/Space%20Shuttle%20Remote%20Manipulator%20System%20(Canadarm)
 - Landsat 8: https://github.com/nasa/NASA-3D-Resources/tree/master/3D%20Models/Landsat%208
 
+## Gantry models
+
+Built by script from the same CC0 textures. **No new assets.**
+
+| Model | Frame origin | Made of |
+|---|---|---|
+| **Rails** (in `client`) | A frame, y = ±rail_y, z = rail_z | Aluminium extrusion, steel running strips, carbon side truss up to the keel |
+| **`bridge`** | Rail line at the beam center | Carbon box truss, guide rails, drive trucks with wheels on the rail |
+| **`carriage`** | Plate center | T-slot plate saddling the beam, bay guides, side frames, motors, cable chain |
+| **`fork_W_head`, `fork_F_head`** | Fork tip (grapple point) | Grapple heads; F adds the crossbar and arm fittings |
+| **`fork_*_stageN`** | Stage's head-side end | Telescoping stages, 4 per fork (carbon W, aluminium F) |
+
+**Assembled check:** `models/obj/previews/gantry_assembled*.png` show the whole gantry mid-pull.
+
 ## Gotchas
 
 | Symptom | Cause | Fix |

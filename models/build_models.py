@@ -15,6 +15,15 @@ each OBJ with vizSupport.createCustomModel):
   arm_link_1..6   each in its own link frame from arm_motion.fk().
   tool            tool frame (origin at the tool point, +x = approach axis).
   overlay_*       module frame, a 2.02 m plate at z = -0.04 (behind the back).
+  bridge          gantry bridge (A axes), origin on the rail line at the beam
+                  center (x, 0, bridge_z); carbon box truss, drive trucks on
+                  the client's rails (which are part of `client`).
+  carriage        carriage + magazine, origin at the plate center
+                  (x, carriage_y, carriage_z); saddles the bridge beam.
+  fork_W_head,    fork heads, origin at the fork tip (grapple point); match
+  fork_F_head     gantry_motion.fork_geometry (F: head, crossbar, arm fittings).
+  fork_*_stageN   telescoping stages, origin at the stage's +z (head) end,
+                  running along -z (gantry_motion.stage_layout).
   keepout_sphere  A axes, origin at the array center: the client.keepout_m
                   sphere, amber, semi-transparent (MTL d, see MAT_ALPHA).
 
@@ -23,6 +32,7 @@ lathed and trussed parts. Textures are copied or derived next to the OBJs
 and referenced by relative path in each MTL.
 """
 import shutil
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -31,13 +41,20 @@ from PIL import Image, ImageDraw, ImageFilter
 from src.config import load_config
 from src.geometry import module_center, module_ids
 from src.modules.arm_motion import fk
+from src.modules.gantry_motion import stage_layout
 
 HERE = Path(__file__).resolve().parent
 OBJ_DIR = HERE / "obj"
 DL = HERE / "downloads"
 
+def _stage_names():
+    cfg = load_config()
+    return [n for k in ("W", "F") for n in stage_layout(cfg, k)["names"]]
+
+
+GANTRY_NAMES = ["bridge", "carriage", "fork_W_head", "fork_F_head", *_stage_names()]
 NAMES = ["client", "module", "servicer", *(f"arm_link_{i}" for i in range(1, 7)),
-         "tool", "overlay_red", "overlay_green", "keepout_sphere"]
+         "tool", "overlay_red", "overlay_green", "keepout_sphere", *GANTRY_NAMES]
 MODEL_FILES = {n: str(OBJ_DIR / f"{n}.obj") for n in NAMES}
 
 # --- materials ----------------------------------------------------------------
@@ -262,6 +279,15 @@ def hull(points, tex_m=0.4):
 
 def cbox(size, center=(0, 0, 0), bevel=0.0, tex_m=0.4):
     """Box with chamfered edges (bevel in meters)."""
+    key = tuple(np.round(np.asarray(size, float), 9)) + (round(float(bevel), 9), float(tex_m))
+    return _cbox_at_origin(key).xf(t=center)
+
+
+@lru_cache(maxsize=None)
+def _cbox_at_origin(key):
+    """The hull is O(n^3) in its points, so each box shape is built once (UVs are taken
+    at the origin, so a translated copy is identical to building it in place)."""
+    *size, bevel, tex_m = key
     h = np.asarray(size, float) / 2
     b = min(bevel, *(h * 0.9)) if bevel else 0.0
     pts = []
@@ -273,7 +299,7 @@ def cbox(size, center=(0, 0, 0), bevel=0.0, tex_m=0.4):
                     p = h - b
                     p[i] = h[i]
                     pts.append(sg * p)
-    return hull(pts, tex_m).xf(t=center)
+    return hull(pts, tex_m)
 
 
 def quad(c, u, v, uv_rep=(1, 1)):
@@ -559,6 +585,7 @@ def build_client(cfg):
             corner = np.array([sx * (a / 2 - 0.3), sy * (a / 2 - 0.3), zf])
             m.add("bus_hardware", "dark_metal", cbox((0.3, 0.3, 0.12), corner - [0, 0, 0.06], 0.02))
             m.add("bus_hardware", "dark_metal", bell(0.025, 0.08, 0.2, "-z", corner - [0, 0, 0.12]))
+    add_rails(m, cfg)
     return m
 
 
@@ -751,6 +778,424 @@ def build_tool(cfg):
     return m
 
 
+# --- gantry (task G2) ---------------------------------------------------------------
+# Frames are the GantrySequence body frames (src/modules/gantry_motion.py), A axes:
+#   bridge     origin on the rail line at the beam center (x, 0, bridge_z)
+#   carriage   origin at the plate center (x, carriage_y, carriage_z)
+#   fork_*_head  origin at the fork tip (grapple point); hardware runs along -z
+#   fork_*_stageN  origin at the stage's +z (head-side) end; the stage runs along -z
+
+RAIL_W, RAIL_H, RAIL_X = 0.10, 0.14, 9.2   # rail section (y, z) and half length along x
+POST_DY = 0.2          # support posts this far outboard of the rail center line
+BEAM_END = 0.18        # bridge beam ends this far inboard of the rail center line
+GUIDE_GAP = 0.012      # bay guide inner face to panel edge
+CHANNEL = 0.06         # carriage channel wall to beam side face (rollers run in it)
+
+
+def bx(lo, hi, bevel=0.003, tex_m=0.3):
+    """Beveled box from its min / max corners."""
+    lo, hi = np.minimum(lo, hi), np.maximum(lo, hi)
+    return cbox(hi - lo, (lo + hi) / 2, bevel, tex_m)
+
+
+def extrusion(m, group, lo, hi, slot_axes=(), bevel=0.004):
+    """Aluminium T-slot extrusion: beveled bar plus dark slot inlays (1 mm proud)
+    centered on the faces normal to slot_axes, running its long axis."""
+    lo, hi = np.minimum(lo, hi).astype(float), np.maximum(lo, hi).astype(float)
+    m.add(group, "aluminum", bx(lo, hi, bevel, tex("aluminum")))
+    L = int(np.argmax(hi - lo))
+    for a in slot_axes:
+        o = 3 - L - a                                   # the third axis
+        c, w = (lo[o] + hi[o]) / 2, 0.22 * (hi[o] - lo[o])
+        for face, sg in ((hi[a], 1), (lo[a], -1)):
+            s0, s1 = lo.copy(), hi.copy()
+            s0[L], s1[L] = lo[L] + 2 * bevel, hi[L] - 2 * bevel
+            s0[o], s1[o] = c - w, c + w
+            s0[a], s1[a] = face - sg * 0.002, face + sg * 0.001
+            m.add(group, "dark_metal", bx(s0, s1, 0.0005, 0.2))
+
+
+def cable_chain(m, group, path, wdir, link=0.05, w=0.07, h=0.03):
+    """Drag chain along a dense polyline `path`: overlapping links of two dark side
+    plates and an aluminium crossbar; wdir is the chain's width direction."""
+    path = np.asarray(path, float)
+    s = np.concatenate([[0], np.cumsum(np.linalg.norm(np.diff(path, axis=0), axis=1))])
+    at = lambda d: np.array([np.interp(d, s, path[:, k]) for k in range(3)])
+    wdir = np.asarray(wdir, float)
+    for i in range(int(s[-1] // link)):
+        a, b = at(i * link), at(min((i + 1) * link + 0.004, s[-1]))
+        t = (b - a) / np.linalg.norm(b - a)
+        R = np.column_stack([t, wdir, np.cross(t, wdir)])
+        L = np.linalg.norm(b - a)
+        for sg in (-1, 1):
+            m.add(group, "dark_metal", cbox((L, 0.008, h), (0, sg * (w / 2 - 0.004), 0), 0.002, 0.1)
+                  .xf(R, (a + b) / 2))
+        m.add(group, "aluminum", cbox((0.012, w - 0.016, 0.006), (0, 0, h / 2 - 0.003), 0.001, 0.1)
+              .xf(R, (a + b) / 2))
+
+
+def add_rails(m, cfg):
+    """Static gantry rails (A frame) at y = +-rail_y, z = rail_z: aluminium extrusion with
+    hardened running strips, end stops, and a carbon side truss up to the keel nodes."""
+    G, c = cfg["gantry"], cfg["client"]
+    ry, rz = G["rail_y"], G["rail_z"]
+    hw, hh = RAIL_W / 2, RAIL_H / 2
+    half = c["slot_m"] * c["grid"] / 2
+    keel_x = np.arange(-half, half + 1e-9, c["slot_m"])
+    py = ry + POST_DY
+    ends = [-RAIL_X + 0.2, RAIL_X - 0.2]
+    for sy, name in ((1, "rail_p"), (-1, "rail_n")):
+        Y = lambda a: sy * a
+        y0 = Y(ry)
+        m.add(name, "aluminum", bx((-RAIL_X, y0 - hw, rz - hh + 0.01), (RAIL_X, y0 + hw, rz + hh - 0.01),
+                                   0.006, tex("aluminum")))
+        for zz in (rz + hh - 0.01, rz - hh + 0.01):  # running strips: wheel faces at rz +- RAIL_H / 2
+            z1 = rz + hh if zz > rz else rz - hh
+            m.add(name, "dark_metal", bx((-RAIL_X + 0.01, y0 - 0.04, zz), (RAIL_X - 0.01, y0 + 0.04, z1), 0.001, 0.3))
+        for dz in (-0.05, 0.05):    # T-slots on the outer face (supports bolt between them)
+            m.add(name, "dark_metal", bx((-RAIL_X + 0.02, Y(ry + hw - 0.002), rz + dz - 0.004),
+                                         (RAIL_X - 0.02, Y(ry + hw + 0.002), rz + dz + 0.004), 0.0005, 0.2))
+        for sx in (-1, 1):          # end stops with a buffer facing the bridge truck bumpers
+            x1 = sx * RAIL_X
+            m.add("rail_stops", "dark_metal", bx((x1 - sx * 0.08, y0 - 0.07, rz - 0.22), (x1, y0 + 0.07, rz + 0.11), 0.01))
+            m.add("rail_stops", "dark_metal",
+                  lathe([(0, 0), (0, 0.03), (0.05, 0.03), (0.06, 0.02), (0.06, 0)], 0.1, 16,
+                        "-x" if sx > 0 else "x", (x1 - sx * 0.08, y0, rz - 0.18)))
+        # supports: bracket on the outer face -> carbon post at |y| = py -> keel node outrigger
+        for x in list(keel_x) + ends:
+            m.add("rail_supports", "aluminum", bx((x - 0.06, Y(ry + hw), rz - 0.04), (x + 0.06, Y(py + 0.03), rz + 0.04),
+                                                 0.005, 0.2))
+            top = -1.0 if x in keel_x else rz + 0.1
+            m.add("rail_supports", "carbon", tube((x, Y(py), rz - 0.04), (x, Y(py), top), 0.03, tex("carbon"), 12))
+            if x in keel_x:
+                m.add("rail_supports", "aluminum", cbox((0.08, 0.08, 0.08), (x, Y(py), -1.0), 0.008, 0.2))
+                m.add("rail_supports", "carbon", tube((x, Y(half), -1.0), (x, Y(py), -1.0), 0.025, tex("carbon"), 12))
+        xs = list(keel_x)
+        m.add("rail_supports", "carbon", tube((xs[0], Y(py), -1.0), (xs[-1], Y(py), -1.0), 0.02, tex("carbon"), 10))
+        for i, (xa, xb) in enumerate(zip(xs, xs[1:])):   # Warren diagonals in the post plane
+            a, b = (xa, xb) if i % 2 == 0 else (xb, xa)
+            m.add("rail_supports", "carbon", tube((a, Y(py), -1.0), (b, Y(py), rz + 0.04), 0.018, tex("carbon"), 10))
+        for xe, xk in ((ends[0], xs[0]), (ends[1], xs[-1])):
+            m.add("rail_supports", "carbon", tube((xk, Y(py), -1.0), (xe, Y(py), rz + 0.08), 0.018, tex("carbon"), 10))
+
+
+def build_bridge(cfg):
+    """Bridge: carbon box truss spanning y between the rails, with side guide rails for the
+    carriage rollers, a top slide rail, an internal harness, and a drive truck at each end
+    whose wheels run on the top, bottom and inner faces of the rail."""
+    G = cfg["gantry"]
+    ry = G["rail_y"]
+    hx, hz = np.array(G["bridge_size"], float) / 2
+    Y = ry - BEAM_END
+    rc = 0.025
+    cx, cz = hx - rc, hz - rc
+    m = Model()
+    for sx in (-1, 1):
+        for sz in (-1, 1):
+            m.add("beam", "carbon", tube((sx * cx, -Y, sz * cz), (sx * cx, Y, sz * cz), rc, tex("carbon"), 14))
+    nb = int(round(2 * Y / 0.6))
+    ys = np.linspace(-Y, Y, nb + 1)
+    rb = 0.011
+    for i, y in enumerate(ys):
+        for sx in (-1, 1):
+            for sz in (-1, 1):
+                m.add("beam", "aluminum", cbox((0.05, 0.05, 0.05), (sx * cx, y, sz * cz), 0.006, 0.2))
+        m.add("beam", "carbon", tube((-cx, y, cz), (cx, y, cz), rb, 0.12, 8), tube((-cx, y, -cz), (cx, y, -cz), rb, 0.12, 8),
+              tube((cx, y, -cz), (cx, y, cz), rb, 0.12, 8), tube((-cx, y, -cz), (-cx, y, cz), rb, 0.12, 8))
+        if i < nb:
+            ya, yb = (ys[i], ys[i + 1]) if i % 2 == 0 else (ys[i + 1], ys[i])
+            m.add("beam", "carbon", tube((-cx, ya, cz), (cx, yb, cz), 0.009, 0.12, 8),
+                  tube((-cx, ya, -cz), (cx, yb, -cz), 0.009, 0.12, 8),
+                  tube((cx, ya, -cz), (cx, yb, cz), 0.009, 0.12, 8), tube((-cx, yb, -cz), (-cx, ya, cz), 0.009, 0.12, 8))
+    for sx in (-1, 1):  # side guide rails: the carriage rollers run on the steel strips at |x| = hx
+        x0, x1 = sorted((sx * (hx - 0.02), sx * (hx - 0.004)))
+        m.add("beam", "aluminum", bx((x0, -Y, hz - 0.1), (x1, Y, hz - 0.04), 0.002, tex("aluminum")))
+        x0, x1 = sorted((sx * (hx - 0.004), sx * hx))
+        m.add("beam", "dark_metal", bx((x0, -Y + 0.01, hz - 0.09), (x1, Y - 0.01, hz - 0.05), 0.0005, 0.3))
+    m.add("beam", "aluminum", bx((-0.04, -Y, hz - 0.025), (0.04, Y, hz), 0.003, tex("aluminum")))   # top slide rail
+    m.add("beam", "dark_metal", bx((0.04, -Y + 0.01, hz - 0.02), (0.06, Y - 0.01, hz), 0.002, 0.3))  # drive rack
+    m.add("beam", "kapton", tube((0.05, -Y, -cz + rb + 0.02), (0.05, Y, -cz + rb + 0.02), 0.02, tex("kapton"), 10))
+
+    for sy in (1, -1):   # drive trucks (|y| = a below), wrapping the rail from the inboard side
+        Yy = lambda a: sy * a
+        rin, rout = ry - RAIL_W / 2, ry + RAIL_W / 2
+        e0, e1 = Y, rin - 0.06
+        m.add("truck", "aluminum", bx((-0.3, Yy(e0), -0.2), (0.3, Yy(e1), 0.2), 0.012, tex("aluminum")))
+        for sz in (1, -1):
+            z0, z1 = sorted((sz * 0.16, sz * 0.2))
+            m.add("truck", "aluminum", bx((-0.3, Yy(e1), z0), (0.3, Yy(rout + 0.04), z1), 0.008, tex("aluminum")))
+            z0, z1 = sorted((sz * 0.075, sz * 0.16))
+            m.add("truck", "aluminum", bx((-0.3, Yy(rout + 0.01), z0), (0.3, Yy(rout + 0.04), z1), 0.006, tex("aluminum")))
+            zc = sz * (RAIL_H / 2 + 0.045)
+            for x in (-0.17, 0.17):   # load wheels on the top / bottom running strips
+                prof = [(-0.03, 0), (-0.03, 0.036), (-0.026, 0.045), (0.026, 0.045), (0.03, 0.036), (0.03, 0)]
+                m.add("wheels", "dark_metal", lathe(prof, 0.1, 24, "y", (x, Yy(ry), zc)))
+                m.add("wheels", "aluminum", lathe([(-0.031, 0), (-0.031, 0.022), (0.031, 0.022), (0.031, 0)],
+                                                  0.1, 16, "y", (x, Yy(ry), zc)))
+                m.add("wheels", "aluminum", tube((x, Yy(e1), zc), (x, Yy(rout + 0.01), zc), 0.012, 0.1, 10))
+            m.add("truck", "dark_metal", lathe([(0, 0), (0, 0.025), (0.05, 0.025), (0.06, 0.016), (0.06, 0)],
+                                               0.1, 14, "x" if sz > 0 else "-x", (0.3 * sz, Yy(ry), -0.18)))
+        for x in (-0.08, 0.08):        # guide wheels on the rail's inner face
+            ac = rin - 0.03
+            m.add("wheels", "dark_metal", lathe([(-0.02, 0), (-0.02, 0.03), (0.02, 0.03), (0.02, 0)], 0.1, 20,
+                                                "z", (x, Yy(ac), 0.0)))
+            m.add("wheels", "aluminum", tube((x, Yy(ac), -0.16), (x, Yy(ac), 0.16), 0.008, 0.1, 8))
+        # drive: gearbox on the +x end of the top wheel line, motor running inboard, encoder cap
+        m.add("drive", "dark_metal", bx((0.3, Yy(e1 + 0.01), 0.08), (0.4, Yy(rout + 0.04), 0.2), 0.01, 0.2))
+        zc = RAIL_H / 2 + 0.045
+        m.add("drive", "aluminum", tube((0.35, Yy(e1 + 0.01), zc), (0.35, Yy(e0 - 0.08), zc), 0.045, 0.2, 20))
+        for k in range(3):
+            a = e0 - 0.01 - k * 0.025
+            m.add("drive", "aluminum", tube((0.35, Yy(a), zc), (0.35, Yy(a - 0.008), zc), 0.05, 0.1, 20))
+        m.add("drive", "dark_metal", tube((0.35, Yy(e0 - 0.08), zc), (0.35, Yy(e0 - 0.11), zc), 0.035, 0.1, 16))
+        m.add("drive", "kapton", tube((0.35, Yy(e0 - 0.095), zc + 0.03), (0.2, Yy(e0), 0.17), 0.008, 0.1, 6))
+    return m
+
+
+def build_carriage(cfg):
+    """Carriage + magazine in its body frame: a split plate of T-slot extrusions and carbon
+    skins saddling the bridge beam (rollers on the beam's guide rails, slide decks on its top),
+    the bay W lift mount on a deck over the beam, the bay F arm mounts on the plate edges,
+    side frames with bay guides up past the front of the stack, drives and a cable chain."""
+    G, c = cfg["gantry"], cfg["client"]
+    hx, hy, hz = np.array(G["carriage_size"], float) / 2
+    hp = G["bay_pitch"] / 2
+    yW, yF = G["waste_side"] * hp, -G["waste_side"] * hp
+    bhx = G["bridge_size"][0] / 2
+    wall, ext = bhx + CHANNEL, 0.08
+    cz = G["carriage_z"]
+    ztop = G["bay_z0"] + c["module_thick_m"] / 2 + 0.075 - cz     # frame top, past the stack front
+    ph = module_visual_m(cfg) / 2
+    stW, stF = stage_layout(cfg, "W"), stage_layout(cfg, "F")
+    m = Model()
+
+    # plate: two halves either side of the beam channel
+    for sx in (-1, 1):
+        S = lambda a, b: sorted((sx * a, sx * b))
+        x0, x1 = S(hx - ext, hx)
+        extrusion(m, "plate", (x0, -hy, -hz), (x1, hy, hz), (0,))
+        x0, x1 = S(wall, wall + ext)
+        extrusion(m, "plate", (x0, -hy, -hz), (x1, hy, hz), (0,))
+        x0, x1 = S(wall + ext, hx - ext)
+        for sy in (-1, 1):
+            y0, y1 = sorted((sy * (hy - ext), sy * hy))
+            extrusion(m, "plate", (x0, y0, -hz), (x1, y1, hz), (1,))
+        cuts = [-hy + ext, -hp - 0.03, -hp + 0.03, -0.03, 0.03, hp - 0.03, hp + 0.03, hy - ext]
+        for ya, yb in zip(cuts[1::2][:-1], cuts[2::2]):
+            extrusion(m, "plate", (x0, ya, -hz), (x1, yb, hz), (1,))
+        for ya, yb in zip(cuts[0::2], cuts[1::2]):
+            m.add("plate", "carbon", bx((x0, ya, hz - 0.02), (x1, yb, hz), 0.002, tex("carbon")),
+                  bx((x0, ya, -hz), (x1, yb, -hz + 0.012), 0.002, tex("carbon")))
+    # slide decks bridging the channel; their undersides ride the beam's top slide rail
+    s1 = stW["sections"][0] / 2 + 0.002
+    w = wall + ext
+    d = (hz, hz + 0.03)
+    m.add("deck", "aluminum", bx((-w, yW - 0.3, d[0]), (-s1[0], yW + 0.3, d[1]), 0.004, tex("aluminum")),
+          bx((s1[0], yW - 0.3, d[0]), (w, yW + 0.3, d[1]), 0.004, tex("aluminum")),
+          bx((-s1[0], yW + s1[1], d[0]), (s1[0], yW + 0.3, d[1]), 0.002, tex("aluminum")),
+          bx((-s1[0], yW - 0.3, d[0]), (s1[0], yW - s1[1], d[1]), 0.002, tex("aluminum")))
+    ties = [0.0, -(hy - 0.04), hy - 0.04]
+    for y in ties:
+        m.add("deck", "aluminum", bx((-w, y - 0.04, d[0]), (w, y + 0.04, d[1]), 0.004, tex("aluminum")))
+    pads = [(x, y, hz) for y in ties for x in (-0.03, 0.03)] + \
+           [(x, yW + dy, hz) for x in (-0.03, 0.03) for dy in (-0.2, 0.2)]
+
+    # bay W lift mount: collar round stage 1 on the deck, lift motor and gearbox beside it
+    o = stW["sections"][0][0] / 2 + 0.045
+    z0, z1 = d[1], d[1] + 0.09
+    for a, b in (((-o, -o), (o, -s1[1])), ((-o, s1[1]), (o, o)), ((-o, -s1[1]), (-s1[0], s1[1])),
+                 ((s1[0], -s1[1]), (o, s1[1]))):
+        m.add("mount_W", "aluminum", bx((a[0], yW + a[1], z0), (b[0], yW + b[1], z1), 0.004, tex("aluminum")))
+    m.add("mount_W", "dark_metal", bx((o - 0.01, yW - 0.045, z0), (o + 0.13, yW + 0.045, z0 + 0.06), 0.006, 0.2))
+    m.add("mount_W", "aluminum", tube((o + 0.075, yW, z0 + 0.06), (o + 0.075, yW, z0 + 0.2), 0.042, 0.2, 20))
+    m.add("mount_W", "dark_metal", tube((o + 0.075, yW, z0 + 0.2), (o + 0.075, yW, z0 + 0.23), 0.03, 0.1, 16))
+    # bay F arm mounts: U-blocks round each stage-1 arm on the plate edge, lift drives behind
+    fx, fy = stF["sections"][0] / 2
+    for xa in stF["x"]:
+        sx = np.sign(xa)
+        S = lambda a, b: sorted((xa + sx * a, xa + sx * b))
+        for sy in (-1, 1):
+            y0, y1 = sorted((yF + sy * (fy + 0.005), yF + sy * (fy + 0.105)))
+            x0, x1 = sorted((sx * (ph + 0.015), sx * hx))
+            m.add("mount_F", "aluminum", bx((x0, y0, hz), (x1, y1, hz + 0.1), 0.006, tex("aluminum")))
+        x0, x1 = S(fx + 0.004, hx - abs(xa))
+        m.add("mount_F", "aluminum", bx((x0, yF - fy - 0.105, hz), (x1, yF + fy + 0.105, hz + 0.1), 0.003, tex("aluminum")))
+        xm = sx * 0.7
+        m.add("drives", "dark_metal", bx((xm - 0.08, yF - 0.07, -hz - 0.06), (xm + 0.08, yF + 0.07, -hz), 0.006, 0.2))
+        m.add("drives", "aluminum", tube((xm, yF, -hz - 0.06), (xm, yF, -hz - 0.24), 0.05, 0.2, 20))
+        m.add("drives", "dark_metal", tube((xm, yF, -hz - 0.24), (xm, yF, -hz - 0.27), 0.035, 0.1, 16))
+        x0, x1 = sorted((xm, xa))
+        m.add("drives", "dark_metal", bx((x0, yF - 0.03, -hz - 0.04), (x1, yF + 0.03, -hz), 0.004, 0.2))
+
+    # magazine side frames: posts, top beams, bracing (clear of both bay footprints)
+    posts_y = [-(hy - 0.04), 0.0, hy - 0.04]
+    for sx in (-1, 1):
+        x0, x1 = sorted((sx * (hx - ext), sx * hx))
+        for y in posts_y:
+            extrusion(m, "frame", (x0, y - 0.04, hz), (x1, y + 0.04, ztop - 0.06), (0, 1))
+        y0, y1 = sorted((G["waste_side"] * 0.04, G["waste_side"] * (hy - ext)))   # bay W side rail
+        extrusion(m, "frame", (x0, y0, 0.37), (x1, y1, 0.43), (0,))
+    for y in posts_y:
+        extrusion(m, "frame", (-hx, y - 0.04, ztop - 0.06), (hx, y + 0.04, ztop), (1,))
+        for sg in (-1, 1):
+            m.add("frame", "carbon", tube((-sg * (hx - ext), y, hz + 0.02), (sg * (hx - ext), y, ztop - 0.07),
+                                          0.015, tex("carbon"), 10))
+    # bay guides: L-angles at the 8 bay corners, GUIDE_GAP off the panel edges, tied to the top beams
+    g, t, leg = ph + GUIDE_GAP, 0.006, 0.05
+    for yc in (yW, yF):
+        for sx in (-1, 1):
+            for sy in (-1, 1):
+                X = lambda a: sx * a
+                Yc = lambda a: yc + sy * a
+                m.add("guides", "aluminum",
+                      bx((X(g), Yc(g - leg), hz), (X(g + t), Yc(g + t), ztop - 0.06), 0.001, tex("aluminum")),
+                      bx((X(g - leg), Yc(g), hz), (X(g + t), Yc(g + t), ztop - 0.06), 0.001, tex("aluminum")))
+                yb = min(posts_y, key=lambda p: abs(p - Yc(g)))
+                ya = yb + 0.04 * np.sign(Yc(g) - yb)
+                m.add("frame", "aluminum", bx((X(g - leg), ya, ztop - 0.06), (X(g + t), Yc(g + t), ztop - 0.02),
+                                              0.002, 0.2))
+    # rollers on the beam's guide rails, carriage y drive (friction wheel + motor), avionics
+    zr = G["bridge_z"] + G["bridge_size"][1] / 2 - 0.07 - cz    # guide strip center, carriage frame
+    rollers = []
+    for y in (-1.7, -0.6, 0.6, 1.7):
+        for sx in (-1, 1):
+            xc = sx * (bhx + 0.03)
+            m.add("rollers", "dark_metal", lathe([(-0.015, 0), (-0.015, 0.03), (0.015, 0.03), (0.015, 0)],
+                                                 0.1, 20, "z", (xc, y, zr)))
+            m.add("rollers", "aluminum", tube((xc, y, zr - 0.035), (xc, y, zr + 0.045), 0.008, 0.1, 8))
+            for za, zb in ((zr + 0.025, zr + 0.045), (zr - 0.035, zr - 0.02)):
+                x0, x1 = sorted((sx * (bhx + 0.01), sx * wall))
+                m.add("rollers", "aluminum", bx((x0, y - 0.045, za), (x1, y + 0.045, zb), 0.002, 0.2))
+            rollers.append((sx * bhx, y, zr))
+    yd = 0.3
+    xd = bhx + 0.03
+    m.add("drives", "dark_metal", lathe([(-0.016, 0), (-0.016, 0.03), (0.016, 0.03), (0.016, 0)], 0.1, 20, "z",
+                                        (xd, yd, zr)))
+    rollers.append((bhx, yd, zr))
+    m.add("drives", "aluminum", tube((xd, yd, -hz - 0.07), (xd, yd, zr), 0.01, 0.1, 8))
+    m.add("drives", "dark_metal", bx((xd - 0.02, yd - 0.08, -hz - 0.07), (wall + 0.27, yd + 0.08, -hz), 0.006, 0.2))
+    m.add("drives", "aluminum", tube((wall + 0.19, yd, -hz - 0.07), (wall + 0.19, yd, -hz - 0.26), 0.045, 0.2, 20))
+    m.add("drives", "dark_metal", tube((wall + 0.19, yd, -hz - 0.26), (wall + 0.19, yd, -hz - 0.29), 0.03, 0.1, 16))
+    m.add("drives", "white_mli", bx((-0.95, -0.45, -hz - 0.16), (-0.45, 0.45, -hz), 0.015, tex("white_mli")))
+    m.add("drives", "radiator", bx((-0.93, -0.43, -hz - 0.17), (-0.47, 0.43, -hz - 0.16), 0.002, 0.5))
+    # cable chain: service loop from the avionics box, hanging under the plate
+    x0 = -0.7
+    zu, zl, r = -hz - 0.015, -hz - 0.015 - 0.18, 0.09
+    ya, yb, yc = -0.44, -1.75, -0.9
+    up = np.column_stack([np.full(30, x0), np.linspace(ya, yb, 30), np.full(30, zu)])
+    th = np.linspace(0, np.pi, 16)
+    bend = np.column_stack([np.full(16, x0), yb - r * np.sin(th), (zu + zl) / 2 + r * np.cos(th)])
+    lo = np.column_stack([np.full(20, x0), np.linspace(yb, yc, 20), np.full(20, zl)])
+    cable_chain(m, "cable_chain", np.vstack([up, bend[1:], lo[1:]]), (1, 0, 0))
+    m.add("cable_chain", "aluminum", bx((x0 - 0.05, yc - 0.03, zl - 0.02), (x0 + 0.05, yc + 0.01, -hz), 0.004, 0.2))
+    # bay camera on the center top beam, looking at the array
+    m.add("camera", "white_mli", bx((-0.05, -0.035, ztop), (0.05, 0.035, ztop + 0.05), 0.006, 0.2))
+    m.add("camera", "dark_metal", lathe([(0, 0.022), (0.02, 0.024), (0.02, 0.0)], 0.1, 16, "z", (0, 0, ztop + 0.05)))
+    m.add("camera", "optics", lathe([(0.0205, 0.018), (0.0205, 0)], 0.1, 16, "z", (0, 0, ztop + 0.05)))
+    m.anchors = {"roller": rollers, "pad": pads, "mount_W": [(x, yW, hz) for x in stW["x"]],
+                 "mount_F": [(x, yF, hz) for x in stF["x"]], "bay_y": {"W": yW, "F": yF}}
+    return m
+
+
+def _grapple_face(m, group, r_in=0.03, r_out=0.055, jaw_r=0.075, z=0.0):
+    """Grapple receptacle on a head's +z face (at z): aluminium ring and three cam jaws
+    that close on the module fixture knob."""
+    m.add(group, "aluminum", lathe([(z + 0.0005, r_out), (z + 0.0005, r_in)], 0.1, 28))
+    m.add(group, "dark_metal", lathe([(z + 0.0003, r_in), (z + 0.0003, 0.0)], 0.1, 20))
+    for k in range(3):
+        a = 2 * np.pi * k / 3 + np.pi / 2
+        m.add(group, "dark_metal", cbox((0.032, 0.02, 0.008), (0, 0, 0), 0.002, 0.1)
+              .xf(rot_z(a), (jaw_r * np.cos(a), jaw_r * np.sin(a), z - 0.002)))
+
+
+def build_fork_W_head(cfg):
+    """Fork W grapple head in the fork frame (tip at the origin, head behind it in -z)."""
+    G = cfg["gantry"]
+    h = np.array(G["fork_W_head"]["size"], float) / 2
+    oz = G["fork_W_head"]["offset"][2]
+    z0, z1 = oz - h[2], oz + h[2]
+    m = Model()
+    m.add("head", "aluminum", bx((-h[0], -h[1], z0), (h[0], h[1], z1 - 0.014), 0.008, tex("aluminum")))
+    m.add("head", "dark_metal", bx((-h[0] + 0.005, -h[1] + 0.005, z1 - 0.014), (h[0] - 0.005, h[1] - 0.005, z1),
+                                   0.003, 0.2))
+    _grapple_face(m, "head", z=z1)
+    for sx in (-1, 1):
+        for sy in (-1, 1):
+            m.add("head", "aluminum", lathe([(z1 - 0.002, 0), (z1 - 0.002, 0.008), (z1 + 0.002, 0.007), (z1 + 0.002, 0)],
+                                            0.05, 8, at=(sx * 0.072, sy * 0.072, 0)))
+    m.add("head", "dark_metal", bx((h[0], -0.03, z0 + 0.01), (h[0] + 0.004, 0.03, z0 + 0.035), 0.001, 0.1))
+    m.add("head", "optics", quad((-h[0] - 0.0004, 0, oz), (0, 0, 0.01), (0, 0.022, 0)))
+    s = stage_layout(cfg, "W")["sections"][-1] / 2      # socket collar round the last stage
+    for a, b in (((-s[0] - 0.014, -s[1] - 0.014), (s[0] + 0.014, -s[1] - 0.001)),
+                 ((-s[0] - 0.014, s[1] + 0.001), (s[0] + 0.014, s[1] + 0.014)),
+                 ((-s[0] - 0.014, -s[1]), (-s[0] - 0.001, s[1])), ((s[0] + 0.001, -s[1]), (s[0] + 0.014, s[1]))):
+        m.add("head", "dark_metal", bx((a[0], a[1], z0 - 0.004), (b[0], b[1], z0 + 0.002), 0.001, 0.1))
+    return m
+
+
+def build_fork_F_head(cfg):
+    """Fork F head in the fork frame: thin grapple head on a carbon / aluminium crossbar
+    that carries the panel from behind, with end fittings where the arms socket in."""
+    G = cfg["gantry"]
+    hd, cb = G["fork_F_head"], G["fork_F_crossbar"]
+    hh, ho = np.array(hd["size"], float) / 2, np.array(hd["offset"], float)
+    ch, co = np.array(cb["size"], float) / 2, np.array(cb["offset"], float)
+    arm = G["fork_F_arm"]
+    ax, ahx = arm["offset"][0], arm["size"][0] / 2
+    z0, z1 = co[2] - ch[2], co[2] + ch[2]
+    xin = ax - ahx                                  # inner face of the arms
+    m = Model()
+    m.add("head", "aluminum", bx(ho - hh, ho + hh, 0.004, tex("aluminum")))
+    _grapple_face(m, "head", z=ho[2] + hh[2])
+    m.add("crossbar", "aluminum", bx((-0.12, -ch[1], z0), (0.12, ch[1], z1), 0.005, tex("aluminum")))
+    m.add("crossbar", "carbon", bx((-xin, -ch[1] + 0.015, z0 + 0.005), (xin, ch[1] - 0.015, z1 - 0.005), 0.002,
+                                   tex("carbon")))
+    for sy in (-1, 1):
+        y0, y1 = sorted((sy * (ch[1] - 0.015), sy * ch[1]))
+        m.add("crossbar", "aluminum", bx((-xin, y0, z0), (xin, y1, z1), 0.003, tex("aluminum")))
+    for sx in (-1, 1):
+        x0, x1 = sorted((sx * (xin - 0.004), sx * (ax + ahx + 0.005)))
+        m.add("fittings", "aluminum", bx((x0, -ch[1] - 0.0045, z0 - 0.035), (x1, ch[1] + 0.0045, z1), 0.005, tex("aluminum")))
+        for y in (-0.06, 0.06):
+            m.add("fittings", "dark_metal", lathe([(0, 0), (0, 0.008), (0.004, 0.007), (0.004, 0)], 0.05, 8, "-z",
+                                                  (sx * ax, y, z0 - 0.035)))
+    return m
+
+
+def build_stage(cfg, which, i):
+    """Telescoping stage i of fork `which` in its stage frame (origin at the +z end).
+    W: carbon square tube with aluminium wear collars. F: two aluminium T-slot arms
+    with dark collars, at the fork_F_arm x offsets."""
+    st = stage_layout(cfg, which)
+    sx_, sy_ = st["sections"][i - 1]
+    L, e, cl = st["length"], 0.003, 0.03
+    y = st["y"]
+    m = Model()
+    for x in st["x"]:
+        lo, hi = np.array([x - sx_ / 2, y - sy_ / 2]), np.array([x + sx_ / 2, y + sy_ / 2])
+        core, collar = ("carbon", "aluminum") if which == "W" else ("aluminum", "dark_metal")
+        m.add("tube", core, bx((*(lo + e), -L + cl), (*(hi - e), -cl), 0.003, tex(core)))
+        for za, zb in ((-cl, 0.0), (-L, -L + cl)):
+            m.add("collars", collar, bx((*lo, za), (*hi, zb), 0.002, 0.1))
+        if which == "F":
+            for sg in (-1, 1):
+                yy = sorted((y + sg * (sy_ / 2 - e - 0.002), y + sg * (sy_ / 2 - e + 0.001)))
+                m.add("tube", "dark_metal", bx((x - 0.3 * sx_, yy[0], -L + cl + 0.01), (x + 0.3 * sx_, yy[1], -cl - 0.01),
+                                               0.0005, 0.1))
+    return m
+
+
+def gantry_anchors(cfg):
+    """Contact points of the gantry models in their own frames (for connectedness tests)."""
+    G = cfg["gantry"]
+    ry = G["rail_y"]
+    rin = ry - RAIL_W / 2
+    br = {"wheel_top": [(x, sy * ry, RAIL_H / 2) for sy in (1, -1) for x in (-0.17, 0.17)],
+          "wheel_bottom": [(x, sy * ry, -RAIL_H / 2) for sy in (1, -1) for x in (-0.17, 0.17)],
+          "wheel_side": [(x, sy * rin, 0.0) for sy in (1, -1) for x in (-0.08, 0.08)]}
+    return {"bridge": br, "carriage": build_carriage(cfg).anchors}
+
+
 # --- build ------------------------------------------------------------------------
 
 def builders(cfg):
@@ -759,6 +1204,11 @@ def builders(cfg):
            "overlay_green": build_overlay("green"), "keepout_sphere": build_keepout(cfg)}
     for i in range(1, 7):
         out[f"arm_link_{i}"] = build_link(i, cfg)
+    out.update({"bridge": build_bridge(cfg), "carriage": build_carriage(cfg),
+                "fork_W_head": build_fork_W_head(cfg), "fork_F_head": build_fork_F_head(cfg)})
+    for k in ("W", "F"):
+        for i, n in enumerate(stage_layout(cfg, k)["names"], 1):
+            out[n] = build_stage(cfg, k, i)
     return out
 
 
@@ -770,8 +1220,9 @@ def build_all(cfg=None, out=OBJ_DIR, previews=True):
     for name, model in models.items():
         write_obj(model, name, out)
     if previews:
-        from models.preview import render_all
+        from models.preview import render_all, render_assembled
         render_all(models, out)
+        render_assembled(cfg, models, out)
     return {n: str(out / f"{n}.obj") for n in models}
 
 
