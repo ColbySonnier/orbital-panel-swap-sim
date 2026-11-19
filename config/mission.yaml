@@ -6,6 +6,8 @@ orbit:
   inc_deg: 97.6
   raan_deg: 90
   arg_lat_deg: 0
+  mu_km3s2: 398600.4418
+  r_earth_km: 6378.137
   epoch: "2027 MARCH 20 12:00:00.0 (UTC)"
 
 client:
@@ -55,6 +57,7 @@ waypoints:
 
 speeds:
   leg_mps: 0.05
+  accel_mps2: 0.001
   final_mps: 0.02
   slow_zone_m: 10
 
