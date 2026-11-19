@@ -785,7 +785,14 @@ def build_tool(cfg):
 #   fork_*_head  origin at the fork tip (grapple point); hardware runs along -z
 #   fork_*_stageN  origin at the stage's +z (head-side) end; the stage runs along -z
 
-RAIL_W, RAIL_H, RAIL_X = 0.10, 0.14, 9.2   # rail section (y, z) and half length along x
+def rail_dims(cfg):
+    """(width y, height z, half length x) of the rails, from gantry config: the rail runs
+    rail_end_margin_m past the farthest bridge park position at each end."""
+    G = cfg["gantry"]
+    w, h = (float(v) for v in G["rail_section"])
+    return w, h, max(abs(v) for v in G["park_x"].values()) + G["rail_end_margin_m"]
+
+
 POST_DY = 0.2          # support posts this far outboard of the rail center line
 BEAM_END = 0.18        # bridge beam ends this far inboard of the rail center line
 GUIDE_GAP = 0.012      # bay guide inner face to panel edge
@@ -837,6 +844,7 @@ def cable_chain(m, group, path, wdir, link=0.05, w=0.07, h=0.03):
 def add_rails(m, cfg):
     """Static gantry rails (A frame) at y = +-rail_y, z = rail_z: aluminium extrusion with
     hardened running strips, end stops, and a carbon side truss up to the keel nodes."""
+    RAIL_W, RAIL_H, RAIL_X = rail_dims(cfg)
     G, c = cfg["gantry"], cfg["client"]
     ry, rz = G["rail_y"], G["rail_z"]
     hw, hh = RAIL_W / 2, RAIL_H / 2
@@ -883,6 +891,7 @@ def build_bridge(cfg):
     """Bridge: carbon box truss spanning y between the rails, with side guide rails for the
     carriage rollers, a top slide rail, an internal harness, and a drive truck at each end
     whose wheels run on the top, bottom and inner faces of the rail."""
+    RAIL_W, RAIL_H, RAIL_X = rail_dims(cfg)
     G = cfg["gantry"]
     ry = G["rail_y"]
     hx, hz = np.array(G["bridge_size"], float) / 2
@@ -1187,6 +1196,7 @@ def build_stage(cfg, which, i):
 
 def gantry_anchors(cfg):
     """Contact points of the gantry models in their own frames (for connectedness tests)."""
+    RAIL_W, RAIL_H, RAIL_X = rail_dims(cfg)
     G = cfg["gantry"]
     ry = G["rail_y"]
     rin = ry - RAIL_W / 2

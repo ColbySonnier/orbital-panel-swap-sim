@@ -161,6 +161,8 @@ gantry:
   # (magazine_top_z); the last stage is socketed into its head. Stage count = list length.
   # 3 stages cannot cover the 1.25 m stroke inside the 0.47 m retracted gap with
   # 0.05 m overlaps (see stage_layout), so 4 are used.
+  rail_section: [0.10, 0.14]  # rail extrusion (y, z); bridge wheels run on its z faces
+  rail_end_margin_m: 0.6    # rail runs this far past the farthest park_x (trucks + end stops)
   stage_overlap_m: 0.05     # min overlap of neighbouring stages, retracted to extended
   stage_socket_m: 0.02      # last stage runs this far into its head (W) / crossbar (F)
   fork_W_stages: [[0.105, 0.105], [0.09, 0.09], [0.075, 0.075], [0.06, 0.06]]  # (x, y) sections, stage 1 first

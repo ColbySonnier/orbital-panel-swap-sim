@@ -344,9 +344,12 @@ def test_rails_in_client():
         v = g[name]
         mid = (v.max(0) + v.min(0)) / 2
         assert abs(mid[1] - sy * LAY["rail_y"]) < 0.01 and abs(mid[2] - LAY["rail_z"]) < 0.01
-        # rail covers both bridges' travel, trucks included
-        assert v[:, 0].min() < min(G["park_x"].values()) - 0.4
-        assert v[:, 0].max() > max(G["park_x"].values()) + 0.4
+        # rail runs rail_end_margin_m past the farthest park position (trucks + end stops)
+        xe = max(abs(x) for x in G["park_x"].values()) + G["rail_end_margin_m"]
+        assert np.isclose(v[:, 0].min(), -xe, atol=1e-3) and np.isclose(v[:, 0].max(), xe, atol=1e-3)
+        w, hgt = G["rail_section"]
+        assert np.isclose(v[:, 2].max() - v[:, 2].min(), hgt, atol=1e-3)
+        assert np.isclose(np.abs(v[:, 1]).min(), LAY["rail_y"] - w / 2, atol=1e-3)  # inner (guide wheel) face
     assert "rail_supports" in g
 
 
@@ -360,7 +363,7 @@ def test_rails_supported_by_truss():
 
 
 def test_bridge_spans_rails():
-    from models.build_models import RAIL_H
+    RAIL_H = G["rail_section"][1]
     b = models()["bridge"]
     lo, hi = group_box(b, "beam")
     assert np.allclose(hi[[0, 2]], BRIDGE_HALF[[0, 2]], atol=0.005)   # beam = G1 bridge section
@@ -575,3 +578,37 @@ def test_anchors_on_geometry():
         for q in np.array(a["carriage"][f"mount_{k}"]):
             d = [aabb_dist(c, h, q, np.zeros(3)) for _, c, h in mounts]
             assert sum(x < 0.15 for x in d) >= 3, (k, q)
+
+
+def test_fork_heads_fill_geometry():
+    """Fill, not just containment: each fork_geometry box (head, crossbar, F arm ends) is
+    occupied by head-model parts. The parts' AABBs clipped to the box span it within 5 mm on
+    every axis, and points every 1 cm along the box's long axis lie inside a part (no gaps)."""
+    m = models()
+    tol = 0.005
+    for k in ("W", "F"):
+        parts = np.array([(p.V.min(0), p.V.max(0)) for _, _, p in m[f"fork_{k}_head"].chunks if len(p.F)])
+        boxes = list(fork_geometry(cfg, k))
+        zmin = parts[:, 0, 2].min()
+        for c, h in fork_geometry(cfg, k, LAY["bay_grip_z"])[len(boxes):]:   # arm / mast ends in the head
+            top = c[2] + h[2]                                                # head-side end of the member
+            if top - zmin > tol:
+                lo = max(c[2] - h[2], zmin)
+                boxes.append((np.array([c[0], c[1], (lo + top) / 2]), np.array([h[0], h[1], (top - lo) / 2])))
+        if k == "F":
+            assert len(boxes) == 4                                           # head, crossbar, 2 arm ends
+        for c, h in boxes:
+            blo, bhi = c - h, c + h
+            lo = np.maximum(parts[:, 0], blo)
+            hi = np.minimum(parts[:, 1], bhi)
+            hit = np.all(hi - lo > 1e-4, axis=1)
+            assert hit.any(), (k, c)
+            assert np.allclose(lo[hit].min(0), blo, atol=tol) and np.allclose(hi[hit].max(0), bhi, atol=tol), \
+                (k, c, h, lo[hit].min(0), hi[hit].max(0))
+            ax = int(np.argmax(h))
+            n = int(2 * h[ax] / 0.01) + 1
+            pts = np.repeat(c[None], n, 0)
+            pts[:, ax] = np.linspace(blo[ax] + tol, bhi[ax] - tol, n)
+            inside = np.any(np.all((pts[:, None] >= parts[None, :, 0] - 1e-6) &
+                                   (pts[:, None] <= parts[None, :, 1] + 1e-6), axis=2), axis=1)
+            assert inside.all(), (k, c, pts[~inside][:3])
