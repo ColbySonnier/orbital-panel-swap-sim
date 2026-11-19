@@ -11,6 +11,9 @@ Body frames in GantryFrame.bodies, all as (pos_A, dcm) with dcm = I (A axes):
                        along -z from the tip up to the carriage. Fork k sits at
                        y = carriage_y + side_k * bay_pitch / 2 with
                        side_W = waste_side and side_F = -waste_side
+  fork_W_stage1..N,    telescoping stages of each fork's mast (W) / arm pair (F),
+  fork_F_stage1..N     origin at the stage's +z (head-side) end, the stage running
+                       along -z; coaxial with its fork (see stage_layout)
   module_target,       module center; panels translate only
   spare_0..spare_3
 
@@ -131,6 +134,64 @@ def fork_geometry(cfg, which, tip_z=None):
             hx, hy = np.array(m["size"], float) / 2
             out.append((np.array([x, y, (z0 + top) / 2]), np.array([hx, hy, abs(z0 - top) / 2])))
     return out
+
+
+# --- telescoping stages ------------------------------------------------------------
+
+def stage_layout(cfg, which):
+    """Telescoping stages of fork `which` (task G2): N = len(gantry.fork_<which>_stages).
+
+    Stage 1 (widest) is fixed with its top on the carriage's +z face (magazine_top_z).
+    The last stage's head end is at anchor_z in the fork frame: the G1 mast/arm offset
+    plus gantry.stage_socket_m into the head. All stages have the same length, the
+    retracted span (fork at the bay grip), so fully retracted they nest flush and
+    nothing ever reaches behind the carriage face. Between the ends the stroke is
+    shared evenly; the smallest neighbour overlap (fully extended) is overlap_min.
+    Raises ValueError if that is below gantry.stage_overlap_m."""
+    G, lay = cfg["gantry"], gantry_layout(cfg)
+    sec = np.array(G[f"fork_{which}_stages"], float)
+    mast = G["fork_W_mast"] if which == "W" else G["fork_F_arm"]
+    x, y, z0 = (float(v) for v in mast["offset"])
+    xs = [x] if which == "W" else [x, -x]
+    n = len(sec)
+    anchor = z0 + G["stage_socket_m"]
+    top = G["magazine_top_z"]
+    span_min = lay["bay_grip_z"] + anchor - top
+    span_max = lay["grapple_point"][2] + anchor - top
+    length = span_min
+    ov = length - (span_max - length) / (n - 1) if n > 1 else -np.inf
+    if ov < G["stage_overlap_m"] - 1e-9:
+        need = int(np.ceil((span_max - G["stage_overlap_m"]) / (length - G["stage_overlap_m"])))
+        raise ValueError(f"fork {which}: {n} stages of {length:.3f} m overlap only {ov:.3f} m "
+                         f"fully extended (< stage_overlap_m); need >= {need} stages")
+    return {"n": n, "names": [f"fork_{which}_stage{i}" for i in range(1, n + 1)],
+            "sections": sec, "length": float(length), "anchor_z": float(anchor),
+            "x": xs, "y": y, "span": (float(span_min), float(span_max)), "overlap_min": float(ov)}
+
+
+def fork_stage_poses(cfg, which, tip_z, st=None):
+    """{stage name: (offset from the fork tip in A, dcm)} for fork tip z `tip_z`.
+
+    Stage k covers [a_k, a_k + length] measured +z from magazine_top_z, with
+    a_k = (k - 1) / (N - 1) * (span - length); its origin is the +z end."""
+    st = st or stage_layout(cfg, which)
+    top = cfg["gantry"]["magazine_top_z"]
+    span = tip_z + st["anchor_z"] - top
+    ext = max(0.0, span - st["length"])
+    out = {}
+    for k, name in enumerate(st["names"]):
+        z1 = top + ext * k / (st["n"] - 1) + st["length"]
+        out[name] = (np.array([0.0, 0.0, z1 - tip_z]), _I3.copy())
+    return out
+
+
+def stage_boxes(cfg, which, st=None):
+    """{stage name: [(center, half)]} collision boxes in each stage's own frame."""
+    st = st or stage_layout(cfg, which)
+    L = st["length"]
+    return {name: [(np.array([x, st["y"], -L / 2]), np.array([sx / 2, sy / 2, L / 2]))
+                   for x in st["x"]]
+            for name, (sx, sy) in zip(st["names"], st["sections"])}
 
 
 # --- 1-D motion profile --------------------------------------------------------------
@@ -299,6 +360,7 @@ class GantrySequence:
 
         self.duration = t
         self.steps, self.events = steps, events
+        self.stages = {k: stage_layout(cfg, k) for k in ("W", "F")}
         self.t_capture = events[0][0]
 
     def _step(self, t):
@@ -330,6 +392,10 @@ class GantrySequence:
         b["spare_0"] = tip["F"] + up if t <= self.t_release_tool else slot.copy()
         for k in range(1, G["n_fresh"]):              # spares 1..n-1 stay put in bay F
             b[f"spare_{k}"] = np.array([x, tip["F"][1], G["bay_z0"] - k * G["stack_dz"]])
+
+        for k in ("W", "F"):                           # telescoping stages ride on the fork
+            for n, (off, _) in fork_stage_poses(self.cfg, k, fz[k], self.stages[k]).items():
+                b[n] = tip[k] + off
 
         g = lay["grapple_point"]
         contact = any(np.allclose(tip[k][:2], g[:2]) and abs(fz[k] - g[2]) <= G["contact_zone_m"] + 1e-12

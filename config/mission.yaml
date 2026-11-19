@@ -156,6 +156,15 @@ gantry:
   fork_F_head: {size: [0.2, 0.2, 0.015], offset: [0.0, 0.0, -0.0075]}
   fork_F_crossbar: {size: [2.14, 0.2, 0.04], offset: [0.0, 0.0, -0.035]}  # behind the held panel
   fork_F_arm: {size: [0.04, 0.2], offset: [1.05, 0.0, -0.055]}      # (x, y) section; mirrored to -x
+  # Telescoping stages (task G2). Each fork's mast (W) / arm pair (F) is drawn as nested
+  # stages: stage 1 (widest) is fixed with its top on the carriage's +z face
+  # (magazine_top_z); the last stage is socketed into its head. Stage count = list length.
+  # 3 stages cannot cover the 1.25 m stroke inside the 0.47 m retracted gap with
+  # 0.05 m overlaps (see stage_layout), so 4 are used.
+  stage_overlap_m: 0.05     # min overlap of neighbouring stages, retracted to extended
+  stage_socket_m: 0.02      # last stage runs this far into its head (W) / crossbar (F)
+  fork_W_stages: [[0.105, 0.105], [0.09, 0.09], [0.075, 0.075], [0.06, 0.06]]  # (x, y) sections, stage 1 first
+  fork_F_stages: [[0.064, 0.26], [0.056, 0.24], [0.048, 0.22], [0.04, 0.2]]    # per arm (x = +-fork_F_arm x)
 
 viz:
   save_file: "outputs/servicer_demo.bin"

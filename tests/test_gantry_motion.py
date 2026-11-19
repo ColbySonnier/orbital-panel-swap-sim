@@ -6,7 +6,8 @@ from models.build_models import module_visual_m, truss_members
 from src.config import load_config
 from src.geometry import module_center, module_ids
 from src.modules.gantry_motion import (GantrySequence, aabb_dist, body_half,
-                                       fork_geometry, gantry_layout, seg_aabb_dist)
+                                       fork_geometry, fork_stage_poses, gantry_layout,
+                                       seg_aabb_dist, stage_boxes, stage_layout)
 
 cfg = load_config()
 G = cfg["gantry"]
@@ -18,6 +19,7 @@ PANEL_HALF = body_half(cfg)["spare_0"]
 PANELS = ["module_target"] + [f"spare_{k}" for k in range(G["n_fresh"])]
 BODIES = ["bridge_A", "bridge_B", "carriage", "fork_W", "fork_F"] + PANELS
 EVENTS = ["capture", "release_client", "insert_contact", "latched", "release_tool"]
+STAGES = {k: stage_layout(cfg, k)["names"] for k in ("W", "F")}
 TOL = 1e-9
 
 
@@ -211,6 +213,9 @@ def fork_clearance(seq):
         h = held(seq, f, t)
         boxes = {k: [(f.bodies[f"fork_{k}"][0] + o, hh)
                      for o, hh in fork_geometry(cfg, k, f.fork_z[k])] for k in ("W", "F")}
+        for k in ("W", "F"):  # telescoping stages, wider than the G1 mast section
+            for n, bx in stage_boxes(cfg, k).items():
+                boxes[k] += [(f.bodies[n][0] + o, hh) for o, hh in bx]
         for k, other in (("W", "F"), ("F", "W")):
             for c, hh in boxes[k]:
                 for n in PANELS:
@@ -327,7 +332,7 @@ def test_no_teleports(seq):
     worst = 0.0
     for t0, t in zip(ts, ts[1:]):
         cur = seq.at(t).bodies
-        for n in BODIES:
+        for n in BODIES + STAGES["W"] + STAGES["F"]:
             worst = max(worst, np.linalg.norm(cur[n][0] - prev[n][0]) / (t - t0))
         prev = cur
     assert worst <= G["travel_mps"] + 1e-6
@@ -351,3 +356,65 @@ def test_contact_flag(seq):
 
 def test_panel_visual_size_matches_model():
     assert np.allclose(PANEL_HALF[:2], module_visual_m(cfg) / 2)
+
+
+# --- telescoping stages (task G2) -------------------------------------------------
+
+def test_stage_layout():
+    for k, mast in (("W", G["fork_W_mast"]), ("F", G["fork_F_arm"])):
+        st = stage_layout(cfg, k)
+        sec = np.array(G[f"fork_{k}_stages"])
+        assert st["n"] == len(sec) >= 3
+        assert st["names"] == [f"fork_{k}_stage{i}" for i in range(1, st["n"] + 1)]
+        assert np.allclose(sec[-1], mast["size"])            # last stage = G1 mast section
+        assert np.all(np.diff(sec, axis=0) < 0)               # stage 1 widest, strictly nested
+        assert st["overlap_min"] >= G["stage_overlap_m"]
+        assert st["length"] > 0.3
+
+
+def test_three_stages_infeasible():
+    """Why 4 stages: 3 can't span the stroke inside the retracted gap with the overlap."""
+    import copy
+    c = copy.deepcopy(cfg)
+    c["gantry"]["fork_W_stages"] = c["gantry"]["fork_W_stages"][1:]
+    with pytest.raises(ValueError):
+        stage_layout(c, "W")
+
+
+def test_stages_nest_and_overlap(seq):
+    """Review Focus 2: stage 1 sits on the carriage face, neighbours overlap >= stage_overlap_m,
+    the last stage ends inside its head, and nothing goes behind the carriage face."""
+    top = G["magazine_top_z"]
+    worst = np.inf
+    for t in samples(seq, 0.5):
+        f = seq.at(t)
+        for k in ("W", "F"):
+            st = stage_layout(cfg, k)
+            tip = f.bodies[f"fork_{k}"][0]
+            iv = []
+            for n in st["names"]:
+                p, R = f.bodies[n]
+                assert np.allclose(R, np.eye(3))
+                assert np.allclose(p[:2], tip[:2])            # coaxial with the fork
+                iv.append((p[2] - st["length"], p[2]))        # stage spans z0..z1 (origin at +z end)
+            assert abs(iv[0][0] - top) < 1e-9
+            assert min(a for a, _ in iv) >= top - 1e-9
+            for (a0, a1), (b0, b1) in zip(iv, iv[1:]):
+                ov = min(a1, b1) - max(a0, b0)
+                worst = min(worst, ov)
+                assert ov >= G["stage_overlap_m"] - 1e-9, (t, k, ov)
+            heads = fork_geometry(cfg, k)
+            z_lo = tip[2] + min(o[2] - h[2] for o, h in heads)
+            z_hi = tip[2] + max(o[2] + h[2] for o, h in heads)
+            assert z_lo - 1e-9 <= iv[-1][1] <= z_hi + 1e-9   # last stage ends inside the head
+            assert np.isclose(iv[-1][1], tip[2] + st["anchor_z"])
+    print("min stage overlap (m):", worst)
+
+
+def test_stage_poses_match_bodies(seq):
+    for t in (0.0, seq.duration / 3, seq.duration / 2):
+        f = seq.at(t)
+        for k in ("W", "F"):
+            tip = f.bodies[f"fork_{k}"][0]
+            for n, (off, R) in fork_stage_poses(cfg, k, f.fork_z[k]).items():
+                assert np.allclose(f.bodies[n][0], tip + off) and np.allclose(f.bodies[n][1], R)
