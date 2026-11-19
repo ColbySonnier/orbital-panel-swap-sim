@@ -29,7 +29,7 @@ import numpy as np
 from Basilisk.simulation import vizInterface
 from Basilisk.utilities import vizSupport
 
-from models.build_models import MODEL_FILES
+from models.build_models import MODEL_FILES, stale_models
 from src.geometry import client_mass_props
 
 OVERLAYS = ["overlay_red", "overlay_green"]
@@ -83,6 +83,12 @@ def setup_viz(sim, task, client_sc, bodies, cfg):
     """Create the vizInterface (saved replay) with every model, the work light,
     three cameras and the display settings. `bodies` maps a body name to its
     standalone SCStatesMsg (gantry, panels, overlays). Returns the viz module."""
+    stale = stale_models()
+    if stale:
+        raise RuntimeError(
+            f"Stale or missing model files ({', '.join(stale)}). The OBJs in models/obj/ "
+            "were built before the current Vizard frame convention. Rebuild them with:\n"
+            "  python -m models.build_models")
     _reset_vizsupport_lists()
     names = list(bodies)
     sc_list = [client_sc, *((n, bodies[n]) for n in names)]

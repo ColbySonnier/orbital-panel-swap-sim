@@ -12,7 +12,7 @@ All shipped models are **built by script** from **CC0 textures**. No third-party
 
 | Asset | License | Size | Used for | Source |
 |---|---|---|---|---|
-| **SolarPanel001** | CC0 1.0 | 5.8 MB | Solar cells (modules, servicer body panels) | https://ambientcg.com/a/SolarPanel001 |
+| **SolarPanel001** | CC0 1.0 | 5.8 MB | Solar cells (client array and the spare modules) | https://ambientcg.com/a/SolarPanel001 |
 | **Foil002** | CC0 1.0 | 7.3 MB | Gold and white MLI, kapton harness (crinkle and normal map) | https://ambientcg.com/a/Foil002 |
 | **Metal051A** | CC0 1.0 | 3.1 MB | Aluminum and dark anodized hardware | https://ambientcg.com/a/Metal051A |
 | **Fabric004** | CC0 1.0 | 3.0 MB | Carbon-fiber truss and module back sheets | https://ambientcg.com/a/Fabric004 |
@@ -33,12 +33,12 @@ The download URLs are in `assets_manifest.yaml`.
 
 ## Evaluated, not used
 
-Colby approved these and they were downloaded to `models/downloads/`. **Neither ships in a model.**
+Colby approved these and they were downloaded to `models/downloads/`. **Neither ships in a model.** The current design is an on-board rail gantry, so there is no arm and no servicer body for them to fill.
 
-| Asset | License | Why not used |
+| Asset | License | Status |
 |---|---|---|
-| **NASA Shuttle RMS (Canadarm)** | NASA, free and without copyright (public domain) | **One fused mesh**, about 1080 faces, not split into links. Splitting it isn't worth it. The arm links are **rebuilt in Canadarm style** instead: white MLI booms, metal joint housings, a snare end effector. Used as a visual reference only. |
-| **NASA Landsat 8** | NASA, free and without copyright (public domain) | **No textures**, only flat colors. The 4.9 x 2.7 x 2.7 m body would need a **distorting squash** to fit the 1.2 x 1.0 x 1.0 m servicer box. Its instruments and aft thrusters would **clash with the rack** on the top and bottom faces. The servicer is built from foil and metal textures instead. |
+| **NASA Shuttle RMS (Canadarm)** | NASA, free and without copyright (public domain) | **Not used.** Visual reference only. |
+| **NASA Landsat 8** | NASA, free and without copyright (public domain) | **Not used.** No textures, only flat colors. |
 
 Source pages:
 - Canadarm: https://github.com/nasa/NASA-3D-Resources/tree/master/3D%20Models/Space%20Shuttle%20Remote%20Manipulator%20System%20(Canadarm)

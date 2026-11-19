@@ -26,7 +26,7 @@ All positions are in array frame A: origin at the array center, +z toward the Su
 | **Rails** | Two rails along x at **y = ±8.6 m, z = −2.0 m**, behind the truss (truss keel at z = −1.0). Static, so they're part of the client model |
 | **Bridges** | **Two**, each spanning y (17.2 m) at z = −2.0. **Bridge A** covers columns 1–3 (x ≤ −2.6), **bridge B** covers columns 6–8 (x ≥ +2.6). Two are needed because the center bus mount and standoff block a single bridge. Parked at x = ±8.6 |
 | **Carriage** | Rides its bridge in y and holds a **two-bay magazine** |
-| **Magazine** | **Bay W (waste):** empty at start, receives the dead panel. **Bay F (fresh):** a stack of **4 fresh panels**. Bays sit side by side in y with **2.1 m pitch**, panels parallel to the array. The bottom panel is at z = −1.4, stack pitch 0.1 m |
+| **Magazine** | **Bay W (waste):** empty at start, receives the dead panel. **Bay F (fresh):** a stack of **4 fresh panels**. Bays sit side by side in y with **2.1 m pitch**, panels parallel to the array. The bottom panel is at z = −1.25, stack pitch 0.17 m (amended: both changed from −1.4 / 0.1 to clear fork F's crossbar) |
 | **Forks** | One lift fork per bay. Each moves along z from its bay down to the array's grapple point |
 
 ## Swap sequence (bridge B, target M(2,7) at A (5, −5, 0))

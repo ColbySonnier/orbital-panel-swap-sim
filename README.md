@@ -13,7 +13,7 @@ A **Basilisk + Vizard** demo. An on-board rail gantry on an orbital data center 
 
 | # | Do this | You should see |
 |---|---|---|
-| 1 | **Build the models** (first time only):<br>`~/miniconda3/bin/python -m models.fetch_assets`<br>`~/miniconda3/bin/python -m models.build_models` | OBJ + MTL + textures in `models/obj/` |
+| 1 | **Build the models** (first time, **and again after any pull that touches `models/`**):<br>`~/miniconda3/bin/python -m models.fetch_assets`<br>`~/miniconda3/bin/python -m models.build_models` | OBJ + MTL + textures in `models/obj/`. The sim **refuses to run with Vizard** on stale OBJs and tells you to rerun `build_models` |
 | 2 | **Run the sim:**<br>`~/miniconda3/bin/python -m src.scenario_servicing` | Phase list, event times, `replay ... (4.8 MB)`, 4 plot paths |
 | 3 | **Open Vizard:** Select, then `outputs/servicer_demo.bin`, then **Start Visualization** | The array over Earth, HUD in the corner |
 
@@ -44,7 +44,7 @@ Speeds are **suggestions**. At these speeds the swap plays in about **1.5 to 2 m
 | **Shift**: carriage moves to the spare | 1067 - 1124 | Swap close-up | 16x |
 | **Drop in**: spare seats (contact at 1189) | 1124 - 1200 | Swap close-up | 8x |
 | **Latch** (latched at 1210) | 1200 - 1215 | Swap close-up | 4x |
-| **Retract**: forks pull back (release at 1215) | 1215 - 1295 | Swap close-up | 16x |
+| **Retract**: fork F pulls back to the stack (release at 1215) | 1215 - 1295 | Swap close-up | 16x |
 | **Checkout hold**, then **green at 1330** | 1296 - 1330 | Swap close-up | 8x |
 | **Roll home**: bridge drives back to park | 1330 - 1548 | Gantry view, then Wide orbit view | 32x |
 | **Done tail** (nothing moves) | 1548 - 1670 | Wide orbit view | Trim it |
@@ -67,14 +67,16 @@ All three are client cameras, mounted on the data center. Poses live in `viz.cam
 | Segfault or `std::bad_alloc` in `VizInterface` | Vizard keeps **raw pointers to lights**. A garbage-collected `Light` crashes it. | Already fixed: `viz_setup._LIVE_LIGHTS` holds them. **Keep any new lights in that list.** |
 | Replay is named `servicer_demo.bin` | **Historical name** from the old free-flyer design | Rename via `viz.save_file` in `config/mission.yaml` if you want |
 | Red/green frame looks like **four bars** from behind | The back frame has open corners to clear the truss | Expected. The front rim is a full ring. |
+| `Stale or missing model files` error | `models/obj/` is git-ignored, so OBJs built before a frame fix linger | `python -m models.build_models` |
 | Model loads untextured | MTL can't find textures | Keep OBJ, MTL and textures together in `models/obj/` |
 | Green arrives mid-retract | Checkout hold shorter than about 86 s | Keep `holds_s.checkout` above **86 s** |
 
 ## Known limits
 
+- **A failed checkout ends the run.** The sim stops at the failed checkout, leaves the gantry retracted, and prints `CHECKOUT FAILED`. It does not roll home.
 - **Fidelity Level 1:** client attitude is **ideal**, and gantry motion is **scripted**.
 - **Column 6 is tight** against the bus standoff for the magazine footprint. The demo uses **column 7**.
-- **Visuals not hand-tuned in Vizard yet:** camera framing, work light, and the overlay look came from geometry. Adjust `viz.cameras` and `viz.work_light` in config.
+- **Visuals not hand-tuned in Vizard yet:** camera framing, work light, and the overlay look came from geometry. Adjust `viz.cameras` and `viz.work_light` in config. `viz.rate_s` sets the Vizard pose-writer step.
 - **No Earth albedo:** vizSupport 2.12.2 has no earthshine setting. Lighting is ambient (0.55) plus a work-light spotlight.
 
 ## What's in the repo
@@ -89,7 +91,7 @@ All three are client cameras, mounted on the data center. Poses live in `viz.cam
 | `src/plots.py` | The 4 plots |
 | `config/mission.yaml` | **All parameters**: orbit, power, gantry, cameras |
 | `models/` | Model builders, asset fetcher, `ASSETS.md` |
-| `tests/` | 88 tests |
+| `tests/` | 94 tests |
 | `docs/superpowers/specs/` | Design docs |
 | `outputs/` | Replay and plots (generated) |
 
@@ -99,7 +101,7 @@ All three are client cameras, mounted on the data center. Poses live in `viz.cam
 ~/miniconda3/bin/python -m pytest -q
 ```
 
-Expect **88 passed** in about 100 s.
+Expect **94 passed** in about 2 minutes.
 
 ## Outputs
 

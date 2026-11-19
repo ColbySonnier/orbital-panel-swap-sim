@@ -95,7 +95,7 @@ gantry:
 
 viz:
   save_file: "outputs/servicer_demo.bin"
-  rate_s: 1.0
+  rate_s: 1.0              # Vizard recording / pose-writer step (s)
   # The gantry works on the array's shadowed back side (-z_A, away from the Sun).
   # 0.55 lifts the unlit hardware enough to read its textures; the sunlit cell
   # face is still clearly brighter. 0.35 (free-flyer value) left the back dark.

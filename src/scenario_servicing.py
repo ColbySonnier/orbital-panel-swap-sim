@@ -47,6 +47,9 @@ PHASES = ["Monitoring", "Go / no-go", "Gantry swap", "Checkout", "Return", "Done
 STEP_LABELS = {"roll_out": "Roll out", "align_waste": "Align waste bay", "grab": "Grab",
                "pull": "Pull", "shift": "Shift", "drop_in": "Drop in", "latch": "Latch",
                "retract": "Retract", "roll_home": "Roll home"}
+OUTCOMES = {"complete": "swap complete, gantry home",
+            "checkout_fail": "CHECKOUT FAILED: run stopped, gantry left retracted at the slot",
+            "t_max": "STOPPED at run.t_max_s before the swap finished"}
 TRACE_BODIES = ("module_target", "spare_0", "overlay_red", "overlay_green", "bridge_B")
 
 
@@ -74,6 +77,7 @@ class RunLog:
     viz_settings: dict = field(default_factory=dict)  # snapshot; the viz module is released
     wall_s: float = 0.0
     replay: Path | None = None
+    outcome: str = "complete"  # complete | checkout_fail | t_max
 
 
 class Glue(sysModel.SysModel):
@@ -302,8 +306,9 @@ def build(cfg, viz=True):
     sim = SimulationBaseClass.SimBaseClass()
     proc = sim.CreateNewProcess("proc")
     dt = macros.sec2nano(cfg["run"]["dt_s"])
+    rates = {"env": dt, "dyn": dt, "fsw": dt, "viz": macros.sec2nano(cfg["viz"]["rate_s"])}
     for name, prio in (("env", 400), ("dyn", 300), ("fsw", 200), ("viz", 100)):
-        proc.addTask(sim.CreateNewTask(name, dt), prio)
+        proc.addTask(sim.CreateNewTask(name, rates[name]), prio)
 
     dcm_AN = client_dcm_AN(cfg)
     grav = simIncludeGravBody.gravBodyFactory()
@@ -369,6 +374,7 @@ def run(cfg=None, viz=True, outdir=REPO / "outputs", verbose=False):
     rc = cfg["run"]
     sim.InitializeSimulation()
     t, last = 0.0, None
+    outcome = "t_max"
     while t < rc["t_max_s"]:
         t += rc["chunk_s"]
         sim.ConfigureStopTime(macros.sec2nano(t))
@@ -378,7 +384,13 @@ def run(cfg=None, viz=True, outdir=REPO / "outputs", verbose=False):
             print(f"  t={t:7.0f} s  phase {last} {PHASES[last]:12s}"
                   f"  wall {time.time() - wall0:6.1f} s", flush=True)
         if glue.phase == 5 and glue.L["t"][-1] - glue.phase_start[5] >= rc["home_tail_s"]:
+            outcome = "complete"
             break
+        if glue.phase == 3 and glue.failed and not glue.passed:
+            outcome = "checkout_fail"  # gantry stays retracted; nothing more to show
+            break
+    else:
+        outcome = "t_max"
     P["grav"].unloadSpiceKernels()
     L = glue.L
     log = RunLog(
@@ -388,7 +400,8 @@ def run(cfg=None, viz=True, outdir=REPO / "outputs", verbose=False):
         bridge_x=np.array(L["bx"]), carriage_y=np.array(L["cy"]), fork_z=np.array(L["fz"]),
         overlay=L["overlay"], events=glue.events, phase_start=dict(glue.phase_start),
         seq_steps=list(seq.steps), seq_duration=float(seq.duration),
-        pre_fault_power=glue.pre_fault_power, trace=writer.trace, cfg=cfg)
+        pre_fault_power=glue.pre_fault_power, trace=writer.trace, cfg=cfg,
+        outcome=outcome)
     if viz:
         from Basilisk.utilities import vizSupport
         vm = P["viz"]
@@ -406,23 +419,29 @@ def run(cfg=None, viz=True, outdir=REPO / "outputs", verbose=False):
 
 
 def beats(log):
-    """Video beats: [(label, t0, t1)] in sim seconds."""
+    """Video beats: [(label, t0, t1)] in sim seconds. Phases the run never
+    reached (e.g. after a failed checkout) are skipped."""
     ev = {}
     for t, k, _ in log.events:
         ev.setdefault(k, t)
-    ps = log.phase_start
-    t2 = ps[2]
-    out = [("Fault (strike -> service request)", log.cfg["power"]["strike_t_s"], ev["service_request"]),
-           ("Go / no-go (red on)", ps[1], ps[2])]
-    steps = log.seq_steps
-    for k, (s0, name) in enumerate(steps):
-        if name == "roll_home":
-            continue
-        s1 = steps[k + 1][0]
-        out.append((f"Gantry: {STEP_LABELS[name]}", t2 + s0, t2 + s1))
-    out += [("Checkout hold, then green", ps[3], ps[4]),
-            ("Roll home", ps[4], ps[5]),
-            ("Done (tail)", ps[5], float(log.t[-1]))]
+    ps, t_end = log.phase_start, float(log.t[-1])
+    out = []
+    if "service_request" in ev:
+        out.append(("Fault (strike -> service request)", log.cfg["power"]["strike_t_s"],
+                    ev["service_request"]))
+    if 1 in ps:
+        out.append(("Go / no-go (red on)", ps[1], ps.get(2, t_end)))
+    if 2 in ps:
+        for k, (s0, name) in enumerate(log.seq_steps):
+            if name == "roll_home":
+                continue
+            s1 = log.seq_steps[k + 1][0]
+            if ps[2] + s0 >= t_end:
+                break
+            out.append((f"Gantry: {STEP_LABELS[name]}", ps[2] + s0, min(ps[2] + s1, t_end)))
+    for k, label in ((3, "Checkout hold, then green"), (4, "Roll home"), (5, "Done (tail)")):
+        if k in ps:
+            out.append((label, ps[k], ps.get(k + 1, t_end)))
     return out
 
 
@@ -431,7 +450,8 @@ def summary(log):
     lines = [f"wall time       {log.wall_s:8.1f} s",
              f"sim time        {log.t[-1]:8.0f} s",
              f"final phase     {log.phase[-1]} ({PHASES[log.phase[-1]]})",
-             f"power restored  {100 * log.array_power[-1] / pre:8.2f} % of pre-fault"]
+             f"power restored  {100 * log.array_power[-1] / pre:8.2f} % of pre-fault",
+             f"outcome         {OUTCOMES[log.outcome]}"]
     if log.replay is not None and log.replay.exists():
         lines.append(f"replay          {log.replay} ({log.replay.stat().st_size / 1e6:.1f} MB)")
     if log.viz_settings.get("cameras"):

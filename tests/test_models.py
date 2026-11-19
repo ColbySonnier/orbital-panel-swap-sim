@@ -699,3 +699,29 @@ def test_faces_front_facing_in_unity():
                 tot += 1
                 bad += cr @ nrm < 0
         assert bad <= 0.01 * tot, (name, bad, tot)
+
+
+# --- stale OBJ detection -----------------------------------------------------------
+
+def test_stale_obj_detected_and_viz_setup_refuses(tmp_path, monkeypatch):
+    """OBJs are git-ignored: ones built before the frame fix (no stamp) or missing
+    must be flagged, and setup_viz must refuse with a 'build_models' message."""
+    from models import build_models as bm
+    part = bm.Part(np.eye(3), np.tile([0.0, 0.0, 1.0], (3, 1)), np.zeros((3, 2)), [[0, 1, 2]])
+    fresh = bm.Model().add("g", "aluminum", part)
+    bm.write_obj(fresh, "x", tmp_path)
+    path = tmp_path / "x.obj"
+    assert bm.stale_models({"x": str(path)}) == []
+    path.write_text("\n".join(l for l in path.read_text().splitlines()
+                              if not l.startswith("# vizard-frame")))
+    assert bm.stale_models({"x": str(path)}) == ["x"]
+    assert bm.stale_models({"y": str(tmp_path / "nope.obj")}) == ["y"]
+    import src.viz_setup as vs
+    monkeypatch.setattr(vs, "stale_models", lambda: ["client"])
+    with pytest.raises(RuntimeError, match="build_models"):
+        vs.setup_viz(None, "viz", None, {}, {})
+
+
+def test_shipped_objs_match_frame_convention():
+    from models.build_models import stale_models
+    assert stale_models() == []

@@ -246,3 +246,22 @@ def test_every_body_has_a_model_and_A_axes():
         assert Path(MODEL_FILES[model_key(name)]).exists(), name
     assert model_key("bridge_A") == model_key("bridge_B") == "bridge"
     assert model_key("fork_W") == "fork_W_head" and model_key("spare_3") == "module"
+
+
+# --- failed checkout ---------------------------------------------------------------
+
+def test_failed_checkout_ends_cleanly(tmp_path, monkeypatch, capsys):
+    """Force checkout_fail with an unreachable band: the run stops at the failed
+    checkout (not t_max), beats()/summary()/plots and main() all cope."""
+    import src.scenario_servicing as sc
+    bad = load_config()
+    bad["power"]["checkout_band"] = [1.5, 2.0]
+    monkeypatch.setattr(sc, "load_config", lambda full_timeline=False: bad)
+    sc.main(["--no-viz", "--outdir", str(tmp_path)])
+    out = capsys.readouterr().out
+    assert "CHECKOUT FAILED" in out and "video beats" in out
+    log = run(bad, viz=False, outdir=tmp_path)
+    assert log.outcome == "checkout_fail"
+    assert log.phase[-1] == 3 and 4 not in log.phase_start
+    assert log.t[-1] < bad["run"]["t_max_s"] - 1000
+    assert [n for n, _, _ in sc.beats(log)][-1] == "Checkout hold, then green"

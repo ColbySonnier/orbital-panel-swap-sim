@@ -355,6 +355,29 @@ class Model:
 VIZARD_FROM_BODY = np.array([[0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [-1.0, 0.0, 0.0]])
 
 
+# Stamp of the draw-map convention, written into every OBJ header and checked when
+# the scenario loads them. Bump FRAME_VERSION if the writer's frame logic changes.
+FRAME_VERSION = 2
+FRAME_STAMP = "vizard-frame:{}:{}".format(
+    FRAME_VERSION, ",".join(f"{v:g}" for v in VIZARD_FROM_BODY.ravel()))
+
+
+def stale_models(files=None):
+    """Names of models whose OBJ is missing or was not written with the current
+    frame convention (OBJs are git-ignored, so old ones linger after a pull)."""
+    bad = []
+    for name, path in (files or MODEL_FILES).items():
+        try:
+            with open(path) as f:
+                head = [f.readline().strip() for _ in range(3)]
+        except OSError:
+            bad.append(name)
+            continue
+        if f"# {FRAME_STAMP}" not in head:
+            bad.append(name)
+    return bad
+
+
 def vizard_draws_at(o):
     """Body-frame point(s) Vizard 2.4 draws OBJ file vertex(es) o at (inverse of M)."""
     return np.asarray(o, float) @ VIZARD_FROM_BODY
@@ -367,7 +390,8 @@ def write_obj(model, name, out):
     for g, m, p in model.chunks:
         groups.setdefault(g, []).append((m, p))
     used = sorted({m for _, m, _ in model.chunks})
-    lines = [f"# {name}: built by models/build_models.py", f"mtllib {name}.mtl"]
+    lines = [f"# {name}: built by models/build_models.py", f"# {FRAME_STAMP}",
+             f"mtllib {name}.mtl"]
     ov = ot = on = 1
     for g, items in groups.items():
         lines.append(f"g {g}")

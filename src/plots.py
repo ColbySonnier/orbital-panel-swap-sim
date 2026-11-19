@@ -145,8 +145,10 @@ def gantry_motion(log, path):
     axs[2].text(t[i0], bz, " magazine bay grip", va="bottom", color=INK2, fontsize=9)
     axs[0].axhline(G["park_x"]["B"], color=INK2, ls=":", lw=1)
     axs[2].set_xlabel("Mission time (min)")
-    fig.text(0.01, 0.005, "Bands: gantry step. Bridge and carriage <= 5 cm/s, forks <= 2 cm/s "
-             "(1 cm/s within 10 cm of contact).", fontsize=8, color=INK2)
+    fig.text(0.01, 0.005,
+             f"Bands: gantry step. Bridge and carriage <= {100 * G['travel_mps']:g} cm/s, "
+             f"forks <= {100 * G['fork_mps']:g} cm/s ({100 * G['contact_mps']:g} cm/s within "
+             f"{100 * G['contact_zone_m']:g} cm of contact).", fontsize=8, color=INK2)
     fig.tight_layout(rect=(0, 0.03, 1, 1))
     fig.savefig(path, dpi=150)
     plt.close(fig)

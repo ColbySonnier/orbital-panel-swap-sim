@@ -5,4 +5,3 @@ matplotlib
 pytest
 trimesh
 pillow
-DracoPy  # only to inspect the Draco-compressed NASA GLBs in models/downloads
