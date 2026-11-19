@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 
 from src.config import load_config
-from src.modules.arm_motion import (IKError, SwapSequence, a_to_s,
+from src.modules.arm_motion import (SHOULDER, IKError, SwapSequence, a_to_s,
                                     berth_pose_A, fk, ik, module_corners_S,
                                     obb_overlap, rack_module_pose,
                                     rack_slot_pose, s_to_a, target_fixture_S)
@@ -10,7 +10,6 @@ from src.modules.arm_motion import (IKError, SwapSequence, a_to_s,
 cfg = load_config()
 norm = np.linalg.norm
 deg = np.radians
-SHOULDER = np.array([0.6, 0.0, 0.0])
 BUS_HALF = np.array([0.6, 0.5, 0.5])
 MODULE_HALF = np.array([0.025, 1.0, 1.0])
 Q0 = deg([20, -30, 60, -20, 15, 10])
@@ -39,6 +38,10 @@ def contact_points(seq):
 
 
 # --- kinematics -------------------------------------------------------------
+
+def test_shoulder_on_pedestal_ahead_of_front_face():
+    assert np.allclose(SHOULDER, [0.9, 0, 0])
+
 
 def test_zero_pose_reach():
     frames = fk(np.zeros(6), cfg)
@@ -86,14 +89,15 @@ def test_target_fixture():
 def test_rack_slot_geometry():
     for k in range(6):
         c, Rm = rack_module_pose(k, cfg)
-        side = 1 if k < 4 else -1
-        assert np.isclose(c[1], side * (0.55 + 0.08 * (k % 4 if k < 4 else k - 4)))
+        side = 1 if k < 4 else -1  # spares on top (+z), stow on the bottom
+        assert np.allclose(c, [-0.6, 0, side * (0.55 + 0.08 * (k if k < 4 else k - 4))])
         corners = module_corners_S(c, Rm)
-        assert corners[:, 0].max() <= 0.6 + 1e-9  # not past the front face
+        assert np.isclose(corners[:, 0].max(), 0.4)  # front edge 0.2 m behind shoulder
+        assert np.allclose(np.abs(corners[:, 1]).max(), 1.0)  # parallel to x-y
         assert not obb_overlap(c, Rm, MODULE_HALF, np.zeros(3), np.eye(3), BUS_HALF)
         p, R = rack_slot_pose(k, cfg)
-        assert np.isclose(p[1], c[1] + side * 0.075)  # fixture faces outward
-        assert np.allclose(R[:, 0], [0, -side, 0])  # tool points inward
+        assert np.isclose(p[2], c[2] + side * 0.075)  # fixture faces outward
+        assert np.allclose(R[:, 0], [0, 0, -side])  # tool points inward
 
 
 def test_all_targets_reachable():
@@ -205,13 +209,14 @@ def test_bodies_start_and_end(seq):
     assert np.allclose(seq.at(seq.duration).q, seq.at(0.0).q)  # stowed
 
 
-def test_held_body_follows_tool(seq):
-    f = seq.at(seq.duration * 0.45)
-    assert f.held is not None
-    p, R = fk(f.q, cfg)[-1]
-    c, Rm = f.bodies[f.held]
-    assert np.allclose(c, p + 0.075 * R[:, 0]) and np.allclose(Rm, R)
-
+def test_held_body_follows_tool(samples):
+    _, frames = samples
+    held = [f for f in frames if f.held is not None]
+    assert {f.step for f in held} >= {"6.5", "6.6", "6.8", "6.9"}
+    for f in held:
+        p, R = fk(f.q, cfg)[-1]
+        c, Rm = f.bodies[f.held]
+        assert np.allclose(c, p + 0.075 * R[:, 0]) and np.allclose(Rm, R)
 
 def test_bodies_never_snap(samples):
     # grab and release hand over without a jump; carried motion stays smooth
@@ -223,18 +228,43 @@ def test_bodies_never_snap(samples):
             assert np.degrees(np.arccos(np.clip((np.trace(R1 @ R0.T) - 1) / 2, -1, 1))) <= 2.0
 
 
-def _link_points(q):
+LINK_R = 0.06  # arm link radius for clearance checks
+
+
+def _link_segments(q):
     f = fk(q, cfg)
     ends = [f[0][0], f[3][0], f[4][0], f[7][0]]
-    return np.concatenate([np.linspace(a, b, 30)[1:] for a, b in zip(ends[:-1], ends[1:])])
+    return list(zip(ends[:-1], ends[1:]))
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "Known geometry issue: rack fixtures sit behind the front face (x = -0.4) "
-    "and the arm moves in a vertical plane through a front-face shoulder, so "
-    "reaching the rack sends the upper arm through the bus (about t = 1080-"
-    "2150 s, steps 6.6-6.8). Needs a rack or shoulder geometry change."))
-def test_arm_links_clear_of_bus(samples):
+def _seg_box_dist(a, b, c, R, h, n=60):
+    """Min distance from segment a-b to the box (center c, axes R, half h)."""
+    pts = np.linspace(a, b, n)
+    loc = (pts - c) @ R
+    return norm(np.maximum(np.abs(loc) - h, 0.0), axis=1).min()
+
+
+def _grapple(c, R):
+    return c - 0.075 * R[:, 0]
+
+
+def test_arm_links_clear_of_bus_and_panels(samples):
+    # Every link capsule clears the bus and every panel (racked, seated or
+    # held). Only the wrist link's tool end may touch the panel whose
+    # fixture it is at (within 0.12 m of that grapple point).
     _, frames = samples
+    worst = np.inf
     for f in frames:
-        assert not np.any(np.all(np.abs(_link_points(f.q)) < BUS_HALF, axis=1)), f.step
+        segs = _link_segments(f.q)
+        tool = segs[-1][1]
+        for a, b in segs:
+            d = _seg_box_dist(a, b, np.zeros(3), np.eye(3), BUS_HALF)
+            assert d > LINK_R, (f.step, "bus")
+            worst = min(worst, d)
+        for name in MODULES:
+            c, R = f.bodies[name]
+            for i, (a, b) in enumerate(segs):
+                if i == 2 and norm(tool - _grapple(c, R)) < 0.12:
+                    b = b - 0.15 * (b - a) / norm(b - a)  # tool end is in contact
+                assert _seg_box_dist(a, b, c, R, MODULE_HALF) > LINK_R, (f.step, name, i)
+    assert worst > LINK_R

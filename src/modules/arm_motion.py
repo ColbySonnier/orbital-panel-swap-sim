@@ -14,16 +14,30 @@ Frames:
 dcm_XY maps Y-frame vectors into X (v_X = dcm_XY @ v_Y), so the columns of
 dcm_SL are the L axes written in S.
 
-Arm: shoulder at the front-face center (0.6, 0, 0) (controller ruling; the
-task brief's 0.5 predates the 1.2 m body length). Joint axes at q = 0
+Arm: shoulder on a 0.3 m pedestal out from the front-face center, at
+SHOULDER = (0.9, 0, 0) (see "Pedestal" below). Joint axes at q = 0
 (arm straight along +x_S): z, y at the shoulder; y at the elbow (1.1 m out);
 y, z, x at the wrist (another 1.1 m), then 0.3 m to the tool point.
 
-Rack: spare slots 0-3 on the +y side, stow slots 4-5 on the -y side. Panels
-lie parallel to the S x-z plane, 0.08 m apart outward from |y| = 0.55 m,
-centered at x = -0.4 so the 2 m panels end flush with the front face.
-Fixtures face outward, so the tool points inward (-y on +y slots). Racked
-panels are rolled RACK_ROLL about their normal (same square footprint).
+Rack: spare slots 0-3 on the +z (top) face, stow slots 4-5 on the -z
+(bottom) face. Panels lie parallel to the S x-y plane, centered at
+x = -0.6, y = 0, 0.08 m apart outward from |z| = 0.55 m; their front edge
+is at x = 0.4. Fixtures face outward, so the tool points inward (-z on top).
+All arm work happens in the y = 0 plane (q1 = q5 = q6 = 0): the arm rises
+over (or drops under) the stack's front edge and reaches back to the
+fixture from outside the stack.
+
+Elbow branches: the damaged module is captured elbow-up and its carry ends
+under the bottom stack; the spare's carry from the top stack ends
+elbow-down at the array. The elbow flips (arm straight) only in free
+motion: straight down in 6.7, straight up in 6.12.
+
+Pedestal: from a shoulder on the front face, reaching a fixture at x = -0.6
+needs the upper arm to lean back ~20 deg, which cuts the bus's top-front
+(or bottom-front) corner. Moving the shoulder 0.3 m forward clears that
+corner by ~0.09 m for both stacks. A raised shoulder (e.g. z = +0.3) clears
+neither corner, and one high enough to clear the top cannot reach the
+bottom stack.
 
 Motion: each step is built from joint-space moves and Cartesian moves. A
 Cartesian move is solved by IK on a dense grid (<= 5 mm apart) and
@@ -42,26 +56,39 @@ import numpy as np
 
 from src.geometry import module_center
 
-FRONT_X = 0.6
+SHOULDER = np.array([0.9, 0.0, 0.0])   # on a 0.3 m pedestal off the front face
 BUS_HALF = np.array([0.6, 0.5, 0.5])
 GRAPPLE_GAP = 0.05          # grapple point behind the module back face
-RACK_X, RACK_Y0, RACK_DY = -0.4, 0.55, 0.08
-RACK_STANDOFF = 0.25        # pull-out distance from a rack slot
+RACK_X, RACK_Z0, RACK_DZ = -0.6, 0.55, 0.08
+RACK_STANDOFF = 0.10        # lift-off from a rack slot (the forearm passes
+                            # ~0.2 m above the stack's front edge)
+# Carry via-points between the rack standoff and PULL behind the target
+# slot, top stack (mirrored in z for the bottom): module center (x, z) and
+# tool pitch about y_S in deg (90 = tool down into the top rack, 180 = tool
+# pointing back, 270 = up, 360 = forward at the array). See
+# SwapSequence._rack_transfer_legs for why the panel tumbles 270 deg.
+CARRY_VIA = [(0.2, 1.5, 120.0), (0.6, 2.0, 180.0), (1.2, 1.6, 270.0), (1.7, 0.9, 315.0)]
 APPROACH = 0.10             # tool standoff before capture / after release
 PULL = 0.50                 # extract / insert stroke at the array
+RETRACT = 0.80              # 6.12 straight draw-back before stowing
 SPARE_SLOT, STOW_SLOT = 3, 4
 STEPS = ["6.1", "6.2", "6.3", "6.4", "6.5", "6.6",
          "6.7", "6.8", "6.9", "6.10", "6.11", "6.12"]
 Q_STOW = np.radians([0.0, -80.0, 160.0, -80.0, 0.0, 0.0])
-# Via-point for the 6.7 cross from the stow slot to the spare slot: upper arm
-# straight up, elbow folded, so the tool sweeps a small radius (2 cm/s cap).
-Q_CROSS = np.radians([0.0, -90.0, 150.0, 100.0, 0.0, 0.0])
+# 6.7 swing from under the bottom stack (elbow below the arm line) to over
+# the top stack (elbow above): flip the elbow with the arm straight down,
+# fold the forearm up in front of the pedestal, then raise the upper arm.
+Q_SWING = [np.radians([0.0, 90.0, 0.0, 0.0, 0.0, 0.0]),     # straight down
+           np.radians([0.0, 90.0, -150.0, 0.0, 0.0, 0.0]),  # fold forearm up
+           np.radians([0.0, 0.0, -150.0, 0.0, 0.0, 0.0])]   # raise upper arm
+# 6.12 elbow flip back to the stow branch: upper arm forward with the forearm
+# raised, then straight up (the only safe place to flip), then fold to stow.
+Q_UNWIND = [np.radians([0.0, 0.0, -120.0, 60.0, 0.0, 0.0]),
+            np.radians([0.0, -90.0, 0.0, 0.0, 0.0, 0.0])]
 LATCH_S = 10.0              # latch / grapple actuation holds
 SLOW_MAX = 2.5              # moves run at no less than 1/SLOW_MAX of the limit
 MARGIN = 0.97               # fraction of each limit the profiles may use
 RAMP = 0.15
-RACK_ROLL = np.radians(-90.0)  # panel roll in the rack, +y side (sign picked so joint 6 stays in limits)
-TILT = np.radians(30.0)  # panel tilt while the carry crosses the wrist singularity
 
 
 class IKError(RuntimeError):
@@ -98,15 +125,6 @@ def _log(R):
         w = R[:, i] + np.eye(3)[i]
         return th * w / np.linalg.norm(w)
     return th / (2 * np.sin(th)) * v
-
-
-def _exp(w):
-    th = np.linalg.norm(w)
-    if th < 1e-12:
-        return np.eye(3)
-    k = w / th
-    K = np.array([[0, -k[2], k[1]], [k[2], 0, -k[0]], [-k[1], k[0], 0]])
-    return np.eye(3) + np.sin(th) * K + (1 - np.cos(th)) * K @ K
 
 
 # --- frames -----------------------------------------------------------------
@@ -176,21 +194,17 @@ def obb_overlap(c1, R1, h1, c2, R2, h2, eps=1e-9):
     return True
 
 
-def _rack_y(k):
+def _rack_z(k):
     if k < 4:
-        return RACK_Y0 + RACK_DY * k
-    return -(RACK_Y0 + RACK_DY * (k - 4))
+        return RACK_Z0 + RACK_DZ * k
+    return -(RACK_Z0 + RACK_DZ * (k - 4))
 
 
 def rack_module_pose(k, cfg):
-    """(center_S, dcm_SM) of the module parked in rack slot k (0-5)."""
-    y = _rack_y(k)
-    psi = -np.pi / 2 if y > 0 else np.pi / 2  # x_M points at the bus
-    # Rolled RACK_ROLL about x_M (mirrored on the -y side). The square panel
-    # has the same footprint at any multiple of 90 deg; this roll lets the
-    # arm carry the panel square-aligned through its wrist flip (see
-    # SwapSequence._rack_transfer_legs) with joint 6 inside its limits.
-    return np.array([RACK_X, y, 0.0]), _rz(psi) @ _rx(np.sign(y) * RACK_ROLL)
+    """(center_S, dcm_SM) of the module parked in rack slot k (0-5).
+    x_M points at the bus (-z on top, +z on the bottom): dcm = Ry(+-90 deg)."""
+    z = _rack_z(k)
+    return np.array([RACK_X, 0.0, z]), _ry(np.sign(z) * np.pi / 2)
 
 
 def rack_slot_pose(k, cfg):
@@ -204,7 +218,7 @@ def rack_slot_pose(k, cfg):
 def fk(q, cfg):
     """[(pos_S, dcm_SL)] for base, links 1-6 and the tool (8 entries)."""
     L1, L2, L3 = cfg["arm"]["links_m"]
-    sh = np.array([FRONT_X, 0.0, 0.0])
+    sh = SHOULDER
     R1 = _rz(q[0])
     R2 = R1 @ _ry(q[1])
     el = sh + R2[:, 0] * L1
@@ -329,21 +343,21 @@ class _Move:
         return np.array([np.interp(s, self.tau, self.q[:, j]) for j in range(6)])
 
 
-def _mirror(q):
-    """Joint angles of the arm's mirror image across the S x-z plane."""
-    return np.asarray(q) * np.array([-1, 1, 1, 1, -1, -1])
+def _flip_z(q):
+    """Joint angles of the arm's mirror image across the S x-y plane
+    (planar arm in y = 0: pitch joints change sign)."""
+    return np.asarray(q) * np.array([1, -1, -1, -1, 1, 1])
 
 
 def _joint_move(q0, q1, cfg, n=80, via=None):
-    """Joint-space straight line q0 -> q1, optionally through a via-point
-    (no stop at the via)."""
+    """Joint-space straight lines q0 -> via(s) -> q1 (no stop at a via)."""
     s = np.linspace(0, 1, n)
-    q0, q1 = np.asarray(q0, float), np.asarray(q1, float)
-    if via is None:
-        q = q0 + np.outer(s, q1 - q0)
-    else:
-        q = np.vstack([q0 + np.outer(s, via - q0), (via + np.outer(s, q1 - via))[1:]])
-    return _Move(q, cfg, cfg["arm"]["tip_free_mps"])
+    vias = [] if via is None else ([via] if np.ndim(via) == 1 else list(via))
+    pts = [np.asarray(q0, float)] + [np.asarray(v, float) for v in vias] + [np.asarray(q1, float)]
+    q = [pts[0][None]]
+    for a, b in zip(pts[:-1], pts[1:]):
+        q.append((a + np.outer(s, b - a))[1:])
+    return _Move(np.vstack(q), cfg, cfg["arm"]["tip_free_mps"])
 
 
 def _cart_move(legs, q_seed, cfg, v_tip, step=0.005, max_jump_deg=3.0):
@@ -430,74 +444,42 @@ class SwapSequence:
 
     # --- path helpers -------------------------------------------------------
 
-    def _tool(self, c, psi, theta=0.0, roll=0.0):
-        """Tool pose holding a module centered at c: yaw psi about z_S, then
-        pitch theta about the tool y axis, then roll about the tool axis."""
-        R = _rz(psi) @ _ry(theta) @ _rx(roll)
-        return np.asarray(c, float) - self._d * R[:, 0], R
+    def _tool(self, x, z, theta):
+        """Tool pose holding a module centered at (x, 0, z) pitched theta
+        about y_S (theta = 0: x_M = +x_S; +90 deg: x_M = -z_S)."""
+        R = _ry(theta)
+        return np.array([x, 0.0, z]) - self._d * R[:, 0], R
 
     def _rack_transfer_legs(self, slot):
-        """Module-center legs from a rack slot (seated) out to PULL behind
-        the target slot. Built for the +y side and mirrored for -y.
-        Returns (extract_leg, transfer_legs) as tool-pose callables.
+        """Legs from a rack slot (seated) out to PULL behind the target slot,
+        as tool-pose callables: (extract_leg, transfer_legs).
 
-        Route (+y side; yaw psi of x_M about z_S, yo = slot |y| + standoff):
-          extract  slide out along +y to y = yo                 psi = -90
-          fwd      slide forward along +x to center x = 1.4     psi = -90
-          pivot    yaw to 0 about the panel's bus-side edge, held at
-                   (0.4, yo): the panel stays outboard of the bus and the
-                   rack, and its far edge never passes x = 2.4
-          tilt     in place at (0.4, yo + 1): pitch the panel TILT about
-                   its horizontal in-plane axis
-          a        slide forward along +x to (1.3, yo + 1), tilted. The wrist
-                   flips here (joints 2+3+4 go from ~180 to ~0 deg); the tilt
-                   keeps it off the singularity where the joint 4 and 6 axes
-                   align, which a level carry would have to cross
-          b1       to (1.5, yo + 0.5), tilted
-          spin     in place: roll the panel from RACK_ROLL to 0. Centered at
-                   x = 1.5 the panel clears the bus, the rack and the array
-                   at any roll (half-diagonal 1.41 m)
-          b2       diagonal to PULL behind the slot, untilting
-        The panel keeps RACK_ROLL (square-aligned) through the wrist flip;
-        joint 6 absorbs the flip's 180 deg of roll inside its limits.
+        Planar route in y = 0, given for the top stack as module-center
+        (x, z, pitch) via-points CARRY_VIA and mirrored in z for the bottom
+        stack: lift RACK_STANDOFF off the slot, rise up and forward clear of
+        the stack, then tumble the panel over in front of the servicer
+        (tool down -> back -> up -> forward) and lower it upright.
+
+        Why tumble 270 deg instead of pitching 90 deg: with the arm planar,
+        q2 + q3 + q4 is the tool pitch as a continuous angle. Reaching over
+        the top stack (upper arm leaning back, forearm pointing back) forces
+        q2 + q3 + q4 = -270 deg; the +90 deg equivalent would need q4 ~ 240
+        deg. The array grasp is 0 deg, so within +-170 deg joint limits the
+        panel must turn +270 deg. Turning the arm plane around (q1 = 180
+        deg) would avoid it, but is outside the joint limits.
         """
-        sgn = 1.0 if _rack_y(slot) > 0 else -1.0
-        ys = abs(_rack_y(slot))
-        yo = ys + RACK_STANDOFF
-        seat_c = self._seat_c
-        end = np.array([seat_c[0] - PULL, sgn * seat_c[1]])
-        piv = np.array([0.4, yo])
+        sz = 1.0 if _rack_z(slot) > 0 else -1.0
+        zs = abs(_rack_z(slot))
+        pts = [(RACK_X, zs, 90.0), (RACK_X, zs + RACK_STANDOFF, 90.0)]
+        pts += list(CARRY_VIA) + [(self._seat_c[0] - PULL, 0.0, 360.0)]
+        pts = [(x, sz * z, np.radians(sz * th)) for x, z, th in pts]
 
-        def mk(cfun, psifun, thfun=lambda u: 0.0, roll=0.0):
-            rfun = roll if callable(roll) else (lambda u: roll)
-
-            def leg(u):
-                c = cfun(u)
-                return self._tool([c[0], sgn * c[1], 0.0], sgn * psifun(u), thfun(u),
-                                  sgn * rfun(u))
-            return leg
-
-        def lin(a, b):
-            a, b = np.asarray(a, float), np.asarray(b, float)
-            return lambda u: a + u * (b - a)
-
-        def smooth(u):
-            return u * u * (3 - 2 * u)
-
-        q, r = -np.pi / 2, RACK_ROLL
-        extract = mk(lin([RACK_X, ys], [RACK_X, yo]), lambda u: q, roll=r)
-        fwd = mk(lin([RACK_X, yo], [1.4, yo]), lambda u: q, roll=r)
-        pivot = mk(lambda u: piv + np.array([-np.sin(q * (1 - u)), np.cos(q * (1 - u))]),
-                   lambda u: q * (1 - u), roll=r)
-        top = np.array([0.4, yo + 1.0])
-        tilt = mk(lambda u: top, lambda u: 0.0, lambda u: TILT * smooth(u), roll=r)
-        a = mk(lin(top, [1.3, yo + 1.0]), lambda u: 0.0, lambda u: TILT, roll=r)
-        mid = np.array([1.5, yo + 0.5])
-        b1 = mk(lin([1.3, yo + 1.0], mid), lambda u: 0.0, lambda u: TILT, roll=r)
-        spin = mk(lambda u: mid, lambda u: 0.0, lambda u: TILT,
-                  roll=lambda u: r * (1 - smooth(u)))
-        b2 = mk(lin(mid, end), lambda u: 0.0, lambda u: TILT * (1 - smooth(u)))
-        return extract, [fwd, pivot, tilt, a, b1, spin, b2]
+        def leg(a, b):
+            def f(u):
+                return self._tool(*(np.asarray(a) + u * (np.asarray(b) - np.asarray(a))))
+            return f
+        legs = [leg(a, b) for a, b in zip(pts[:-1], pts[1:])]
+        return legs[0], legs[1:]
 
     @staticmethod
     def _rev(leg):
@@ -568,39 +550,32 @@ class SwapSequence:
         def cart(legs, v, seed=None):
             return _cart_move(legs, self._q if seed is None else seed, cfg, v)
 
-        def joint_to(pose, seed=None):
-            q1 = ik(*pose, self._q if seed is None else seed, cfg)
-            return _joint_move(self._q, q1, cfg)
-
         self._run("6.1", [("fill",)])
-        self._run("6.2", [("move", joint_to(pre))])
+        self._run("6.2", [("move", _joint_move(self._q, ik(*pre, Q_STOW, cfg), cfg))])
         self._run("6.3", [("move", cart([line(pre, (fix_p, fix_R))], cont)),
                           ("grab", "module_target"), ("event", "capture")])
         self._run("6.4", [("fill",)])
         self._run("6.5", [("move", cart([line((fix_p, fix_R), out)], cont)),
                           ("event", "release_client")])
-        # 6.6: swing to the stow slot, insert, latch, let go.
+        # 6.6: carry to the stow slot, insert, latch, let go.
         ext, xfer = self._rack_transfer_legs(STOW_SLOT)
         m_xfer = cart([self._rev(l) for l in reversed(xfer)], free)
         m_ins = cart([self._rev(ext)], cont, m_xfer.q[-1])
         self._run("6.6", [("move", m_xfer), ("move", m_ins), ("hold", LATCH_S),
                           ("release",)])
-        # 6.7: back off the stowed module, cross to the spare, grapple it.
+        # 6.7: back off the stowed module, swing up to the spare, grapple it.
         st_p, st_R = stow
         back4 = (st_p - APPROACH * st_R[:, 0], st_R)
         m_back = cart([line(stow, back4)], cont)
-        q_back = m_back.q[-1]
         sp_p, sp_R = spare
         pre3 = (sp_p - APPROACH * sp_R[:, 0], sp_R)
-        # Same wrist branch as at the stow slot (mirror image), so the spare
-        # carry mirrors the damaged-module carry.
-        q_pre3 = ik(*pre3, _mirror(q_back), cfg)
-        m_cross = _joint_move(q_back, q_pre3, cfg, via=Q_CROSS)
+        q_pre3 = ik(*pre3, _flip_z(m_back.q[-1]), cfg)
+        m_cross = _joint_move(m_back.q[-1], q_pre3, cfg, via=Q_SWING)
         m_app = cart([line(pre3, spare)], cont, q_pre3)
         self._run("6.7", [("hold", LATCH_S), ("move", m_back), ("move", m_cross),
                           ("move", m_app), ("hold", LATCH_S),
                           ("grab", f"spare_{SPARE_SLOT}")])
-        # 6.8: pull the spare out of the rack and carry it behind the slot.
+        # 6.8: lift the spare off the rack and carry it behind the slot.
         ext, xfer = self._rack_transfer_legs(SPARE_SLOT)
         m_ext = cart([ext], cont)
         m_xfer = cart(xfer, free, m_ext.q[-1])
@@ -612,7 +587,10 @@ class SwapSequence:
         m_back = cart([line((fix_p, fix_R), pre)], cont)
         self._run("6.11", [("hold", LATCH_S), ("release",), ("event", "release_tool"),
                            ("move", m_back)])
-        self._run("6.12", [("move", _joint_move(self._q, Q_STOW, cfg))])
+        # 6.12: draw the tool straight back from the seated spare, then stow.
+        m_ret = cart([line(pre, (fix_p - RETRACT * x, fix_R))], free)
+        self._run("6.12", [("move", m_ret),
+                           ("move", _joint_move(m_ret.q[-1], Q_STOW, cfg, via=Q_UNWIND))])
 
     # --- query --------------------------------------------------------------
 
