@@ -1,0 +1,36 @@
+# Assets actually used by models/build_models.py.
+# `python -m models.fetch_assets` downloads each into models/downloads/<dest>/ and
+# skips any that already exist. All are CC0 (ambientCG), 1K JPG PBR sets.
+assets:
+  - name: SolarPanel001
+    use: solar cell faces (module, servicer body panels)
+    url: "https://ambientcg.com/get?file=SolarPanel001_1K-JPG.zip"
+    page: "https://ambientcg.com/a/SolarPanel001"
+    license: "CC0 1.0"
+    size_mb: 5.8
+    dest: solarpanel001
+    check: SolarPanel001_1K-JPG_Color.jpg
+  - name: Foil002
+    use: gold and white MLI blankets, kapton harness (crinkle + normal map)
+    url: "https://ambientcg.com/get?file=Foil002_1K-JPG.zip"
+    page: "https://ambientcg.com/a/Foil002"
+    license: "CC0 1.0"
+    size_mb: 7.3
+    dest: foil002
+    check: Foil002_1K-JPG_Displacement.jpg
+  - name: Metal051A
+    use: aluminum and dark anodized hardware (joints, frames, rails)
+    url: "https://ambientcg.com/get?file=Metal051A_1K-JPG.zip"
+    page: "https://ambientcg.com/a/Metal051A"
+    license: "CC0 1.0"
+    size_mb: 3.1
+    dest: metal051a
+    check: Metal051A_1K-JPG_Color.jpg
+  - name: Fabric004
+    use: carbon-fiber truss tubes and module back sheets
+    url: "https://ambientcg.com/get?file=Fabric004_1K-JPG.zip"
+    page: "https://ambientcg.com/a/Fabric004"
+    license: "CC0 1.0"
+    size_mb: 3.0
+    dest: fabric004
+    check: Fabric004_1K-JPG_Color.jpg

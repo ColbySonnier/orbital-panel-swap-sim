@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 .pytest_cache/
-models/obj/
+models/obj/*
+!models/obj/.gitkeep
 models/downloads/
 outputs/
