@@ -29,10 +29,11 @@ Control:
   Force clip: by vector norm to max_thrust_n (keeps the direction).
 
 Glue contract (caller): on a "failed" event open the module switch; when
-Command.module_installed first becomes True do the power-state swap,
+Command.module_installed first becomes True (on entry to Checkout, once
+the swap has finished and the arm is stowed) do the power-state swap,
 monitor.reset(module) and monitor.start_checkout(...). The manager leaves
-Checkout only after a "checkout_pass" event (it remembers one that arrives
-while the arm is still stowing).
+Checkout only after a "checkout_pass" event, so Checkout lasts at least
+holds_s.checkout and the green overlay only appears from phase 7 on.
 """
 from dataclasses import dataclass, field
 
@@ -59,7 +60,7 @@ class Command:
     thrusters_inhibited: bool
     arm_t: float | None
     overlay: str                 # "none" | "red" | "green"
-    module_installed: bool = False
+    module_installed: bool = False   # True from phase 7 (Checkout) on
     frame: str = "H"             # frame the controller flies in: "H" or "A"
     sub: str = ""                # sub-step label (e.g. "coast", "leg 2/4")
 
@@ -182,9 +183,6 @@ class _Legs:
         self.duration = sum(l.duration for l in self.legs)
 
     def at(self, t):
-        if self.done(t):
-            # StraightLeg.at clamps but keeps acc = -a at the end; hold cleanly.
-            return self.end.copy(), np.zeros(3), np.zeros(3), len(self.legs) - 1
         tl = t - self.t0
         for i, leg in enumerate(self.legs):
             if tl < leg.duration or i == len(self.legs) - 1:
@@ -224,7 +222,6 @@ class MissionManager:
         ev = {name: float(t) for t, name in self.swap.events}
         self._inhibit = [(ev["capture"], ev["release_client"]),
                          (ev["insert_contact"], ev["release_tool"])]
-        self._t_latched = ev["latched"]
 
         self.phase = 0
         self.dv_used = 0.0
@@ -350,12 +347,12 @@ class MissionManager:
             elif ph == 6:
                 arm_t = t - self._t_phase
                 if arm_t >= self.swap.duration:
+                    # ConOps: phase 6 ends at "spare latched, arm stowed".
                     self._enter(7, t)
+                    self._installed = True
                     arm_t = None
                     continue
                 inhibited = any(a <= arm_t <= b for a, b in self._inhibit)
-                if arm_t >= self._t_latched:
-                    self._installed = True
                 self._sub = self.swap.at(arm_t).step
                 a_A = None if inhibited else self._a_track(
                     (self.BERTH, np.zeros(3), np.zeros(3)), rel_A, rel_H, dcm_AH)

@@ -68,6 +68,8 @@ class StraightLeg:
     def at(self, t):
         """(pos, vel, acc) at time t, clamped to [0, duration]."""
         t = min(max(float(t), 0.0), self.duration)
+        if t >= self.duration:  # arrived: at rest at p1
+            return self.p1.copy(), np.zeros(3), np.zeros(3)
         ta, tc, a, v = self.t_acc, self.t_cruise, self.a, self.v
         if t < ta:
             s, sd, sdd = 0.5 * a * t * t, a * t, a

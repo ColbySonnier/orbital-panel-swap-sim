@@ -217,11 +217,16 @@ def test_inhibit_while_linked(sim):
     assert all(c.thrusters_inhibited and norm(c.force_N) == 0.0 for c in linked_cmds)
 
 
-def test_module_installed_after_latch(sim):
-    t_latch = dict((n, t) for t, n in sim["mm"].swap.events)["latched"]
-    for c in sim["cmd"]:
-        if c.arm_t is not None:
-            assert c.module_installed == (c.arm_t >= t_latch)
+def test_module_installed_from_phase_7(sim):
+    """Phase 6 ends at "spare latched, arm stowed": installed from phase 7 on."""
+    assert all(c.module_installed == (c.phase >= 7) for c in sim["cmd"])
+
+
+def test_green_only_after_checkout_hold(sim):
+    t7 = sim["t"][int(np.argmax(sim["phase"] == 7))]
+    t_green = first_t(sim, lambda c: c.overlay == "green")
+    assert t_green >= t7 + cfg["holds_s"]["checkout"] - 1.0
+    assert not any(c.overlay == "green" for c in sim["cmd"] if c.phase <= 6)
 
 
 def test_speed_limits(sim):

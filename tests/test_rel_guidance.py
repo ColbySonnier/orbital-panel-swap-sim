@@ -73,3 +73,10 @@ def test_legs_outside_keepout():
                           cfg["speeds"]["accel_mps2"])
         pts += [leg.at(t)[0] for t in np.linspace(0, leg.duration, 500)]
     assert min(norm(p) for p in pts) >= cfg["client"]["keepout_m"]
+
+
+def test_leg_at_rest_after_end():
+    leg = _leg()
+    for t in (leg.duration, leg.duration + 1.0, leg.duration + 500.0):
+        p, v, a = leg.at(t)
+        assert np.allclose(p, leg.p1) and np.allclose(v, 0) and np.allclose(a, 0)
