@@ -3,7 +3,7 @@ import pytest
 
 from src.config import load_config
 from src.geometry import (array_dcm, client_mass_props, hill_dcm,
-                          module_center, module_ids, waypoints_A)
+                          module_center, module_ids)
 
 cfg = load_config()
 R = np.array([6928e3, 0.0, 0.0])
@@ -37,28 +37,6 @@ def test_array_axes():
     yH = H[1]
     yA = A @ yH  # Hill y seen in A: no x component, positive y component
     assert abs(yA[0]) < 1e-12 and yA[1] > 0
-
-
-def test_berth_and_h3():
-    A, H = frames()
-    w = waypoints_A(cfg, A, H)
-    assert np.allclose(w["BERTH"], [5, -5, -2.6])
-    assert np.allclose(w["H3"], [5, -5, -20])
-    assert np.allclose(w["TARGET"], [5, -5, 0])
-
-
-def test_w3_is_h2_minus_normal():
-    A, H = frames()
-    w = waypoints_A(cfg, A, H)
-    assert np.allclose(w["W3"] - w["H2"], [0, 0, -20])
-
-
-def test_h2_includes_com_offset():
-    A, H = frames()
-    w = waypoints_A(cfg, A, H)
-    _, com, _ = client_mass_props(cfg, set())
-    h2 = A @ H.T @ np.array(cfg["waypoints"]["H2"]) + com
-    assert np.allclose(w["H2"], h2)
 
 
 def test_client_mass():

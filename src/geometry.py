@@ -1,4 +1,4 @@
-"""Geometry and frames for the servicer demo.
+"""Geometry and frames for the rail-gantry demo.
 
 Frames:
   N  inertial
@@ -76,19 +76,3 @@ def client_mass_props(cfg, missing):
     com = sum(b[0] * b[1] for b in bodies) / mass
     I = sum(_shift(b[2], b[0], b[1] - com) for b in bodies)
     return mass, com, I
-
-
-def waypoints_A(cfg, dcm_AN, dcm_HN):
-    """Waypoints in A relative to the array center."""
-    w = cfg["waypoints"]
-    _, com, _ = client_mass_props(cfg, set())
-    dcm_AH = dcm_AN @ dcm_HN.T
-    h2 = dcm_AH @ np.array(w["H2"], float) + com
-    tgt = module_center(*cfg["client"]["target"], cfg)
-    return {
-        "H2": h2,
-        "W3": h2 + w["W3_offset_m"] * np.array([0, 0, -1.0]),
-        "H3": tgt + np.array([0, 0, -w["H3_offset_m"]]),
-        "BERTH": tgt + np.array([0, 0, -w["berth_offset_m"]]),
-        "TARGET": tgt,
-    }

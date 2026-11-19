@@ -9,7 +9,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 # (elev, azim) views per model; default one view
-VIEWS = {"client": [(28, -55), (-30, 125)], "servicer": [(22, 35), (-18, -140)],
+VIEWS = {"client": [(28, -55), (-30, 125)],
          "module": [(35, -60), (-40, 120)],
          "bridge": [(-25, -70)], "carriage": [(-30, -60), (35, 120)],
          "fork_W_head": [(40, -55), (-35, 125)], "fork_F_head": [(-35, -70)]}

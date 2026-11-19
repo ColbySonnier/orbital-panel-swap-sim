@@ -1,29 +1,24 @@
-"""Vizard 2.4 setup for the servicer demo replay.
+"""Vizard 2.4 setup for the rail-gantry replay.
 
 Bodies (one Vizard model each):
-  client          Basilisk Spacecraft. Body frame B = A axes, origin at the
-                  client CoM, so client.obj (origin at the array center) is
-                  drawn with offset = -CoM_A.
-  servicer        Basilisk Spacecraft. Body frame = S (servicer.obj is in S).
-  arm_link_1..6,  standalone SCStatesMsg bodies, each in its fk link frame.
-  tool
-  module_target,  module.obj. The OBJ is built in A axes when seated (+z =
-  spare_0..3      cell normal); arm_motion's M frame has x_M = normal, so
-                  each body's attitude is dcm_NO = dcm_NM @ R_MO (R_MO maps
-                  OBJ coordinates into M: OBJ +z -> x_M).
-  overlay_red,    module-frame plates, seated on M(2,7) or parked 1 km below
-  overlay_green   the client.
-  keepout         keepout_sphere.obj (models/build_models.py, MTL d < 1)
-                  at the array center from inspection on, parked otherwise.
+  client            Basilisk Spacecraft. Body frame B = A axes, origin at the
+                    client CoM, so client.obj (origin at the array center,
+                    rails included) is drawn with offset = -CoM_A.
+  bridge_A/B,       standalone SCStatesMsg bodies written by BodyWriter from
+  carriage,         GantrySequence.at(t).bodies (array frame A):
+  fork_W/F,           r_N = r_client + dcm_NA @ (p_A - com_A),  dcm_NB = dcm_NA @ R_A.
+  fork_*_stage1..4, Every model is built in its body frame with A axes
+  module_target,    (models/build_models.py), and every gantry/panel body has
+  spare_0..3        R_A = I, so no model rotation is applied.
+  overlay_red,      module-frame plates on the slot M(2,7), or parked 1 km
+  overlay_green     along -z_A when hidden.
 
-OBJ axes: Vizard 2.4 imports OBJ with the Dummiesman runtime OBJLoader
-(OBJLoader / MTLLoader classes in Vizard's Assembly-CSharp.dll). It mirrors
-x to convert right-handed OBJ data into Unity's left-handed space, the same
-handedness change Vizard applies to Basilisk body frames, so every OBJ is
-authored directly in its Basilisk body frame and passed with rotation 0.
-The same loader maps MTL map_Bump to Unity's _BumpMap with the _NORMALMAP
-keyword (a tangent-space normal map), and MTL `d` to alpha, so the MTLs are
-used as written and createCustomModel's normalMapPath is left empty.
+OBJ axes: Vizard 2.4 imports OBJ with the Dummiesman runtime OBJLoader. It
+mirrors x to convert right-handed OBJ data into Unity's left-handed space,
+the same handedness change Vizard applies to Basilisk body frames, so every
+OBJ is authored directly in its Basilisk body frame and passed with rotation
+0. MTL map_Bump becomes a tangent-space normal map and MTL `d` alpha, so
+createCustomModel's normalMapPath is left empty.
 """
 from pathlib import Path
 
@@ -32,24 +27,22 @@ from Basilisk.simulation import vizInterface
 from Basilisk.utilities import vizSupport
 
 from models.build_models import MODEL_FILES
-from src.geometry import client_mass_props, module_center
-from src.modules.arm_motion import _ry
+from src.geometry import client_mass_props
 
-# OBJ (seated A axes, +z normal) -> module frame M (x_M normal): v_M = R_MO v_O.
-R_MO = _ry(np.pi / 2)
-
-ARM_BODIES = [f"arm_link_{i}" for i in range(1, 7)] + ["tool"]
-MODULE_BODIES = ["module_target"] + [f"spare_{k}" for k in range(4)]
 OVERLAYS = ["overlay_red", "overlay_green"]
-CLIENT_SIDE = ["module_target", *OVERLAYS, "keepout"]  # listed after the client
-EXTRA_BODIES = CLIENT_SIDE + ARM_BODIES + [f"spare_{k}" for k in range(4)]
-
-CAMERAS = ["Wide pair view", "Servicer to client", "Arm close-up"]
+CAMERAS = ["Wide orbit view", "Gantry view", "Swap close-up"]
+_LIVE_LIGHTS = []  # keeps the Light structs alive while vizInterface points at them
 
 
-def module_dcm_NO(dcm_NS, dcm_SM):
-    """Attitude (dcm_N<-OBJ) of a module body given its M frame in S."""
-    return np.asarray(dcm_NS) @ np.asarray(dcm_SM) @ R_MO
+def model_key(body):
+    """MODEL_FILES key drawn for a gantry/panel/overlay body."""
+    if body.startswith("bridge_"):
+        return "bridge"
+    if body in ("fork_W", "fork_F"):
+        return f"{body}_head"
+    if body == "module_target" or body.startswith("spare_"):
+        return "module"
+    return body  # carriage, fork_*_stageN, overlay_*
 
 
 def _reset_vizsupport_lists():
@@ -59,79 +52,75 @@ def _reset_vizsupport_lists():
     del vizSupport.stdCameraList[:]
 
 
-def setup_viz(sim, task, client_sc, servicer_sc, extra_bodies, cfg):
-    """Create the vizInterface (saved replay) with every model, the corridor
-    shapes, three cameras and the display settings. extra_bodies maps a
-    body name to its standalone SCStatesMsg. Returns the viz module."""
+def _look(cam, com):
+    """(position_B, unit pointing_B) of a camera given in A (eye, target)."""
+    eye, tgt = np.array(cam["eye_A"], float), np.array(cam["target_A"], float)
+    d = tgt - eye
+    return list(eye - com), list(d / np.linalg.norm(d))
+
+
+def work_light(cfg, com):
+    """Client-mounted spotlight on the back-side work zone (viz.work_light)."""
+    w = cfg["viz"]["work_light"]
+    pos, nrm = _look({"eye_A": w["pos_A"], "target_A": w["target_A"]}, com)
+    li = vizInterface.Light()
+    li.label = "Work light"
+    li.position = pos
+    li.normalVector = nrm
+    li.fieldOfView = np.radians(w["fov_deg"])
+    li.range = float(w["range_m"])
+    li.intensity = float(w["intensity"])
+    li.lightOn = 1
+    li.showLightMarker = -1
+    li.showLensFlare = -1
+    return li
+
+
+def setup_viz(sim, task, client_sc, bodies, cfg):
+    """Create the vizInterface (saved replay) with every model, the work light,
+    three cameras and the display settings. `bodies` maps a body name to its
+    standalone SCStatesMsg (gantry, panels, overlays). Returns the viz module."""
     _reset_vizsupport_lists()
-    client_extra = [n for n in CLIENT_SIDE if n in extra_bodies]
-    servicer_extra = [n for n in extra_bodies if n not in client_extra]
-    sc_list = [client_sc, *((n, extra_bodies[n]) for n in client_extra),
-               servicer_sc, *((n, extra_bodies[n]) for n in servicer_extra)]
-    # true-path colors: only the servicer's trail is drawn (alpha 1/255 ~ off;
-    # 0 would mean "Vizard default")
-    off = [0, 0, 0, 1]
-    colors = [[60, 220, 255, 255] if sc is servicer_sc else off for sc in sc_list]
+    names = list(bodies)
+    sc_list = [client_sc, *((n, bodies[n]) for n in names)]
+    off = [0, 0, 0, 1]  # true-path color alpha 1/255 ~ off (0 = Vizard default)
     save = Path(cfg["viz"]["save_file"])
     if not save.is_absolute():
         save = Path(__file__).resolve().parents[1] / save
     save.parent.mkdir(parents=True, exist_ok=True)
-    viz = vizSupport.enableUnityVisualization(sim, task, sc_list, saveFile=str(save),
-                                              trueOrbitColorList=colors)
-
-    c = cfg["client"]
     _, com, _ = client_mass_props(cfg, set())
-    name_c, name_s = client_sc.ModelTag, servicer_sc.ModelTag
+    lights = [[work_light(cfg, com)]] + [None] * len(names)
+    viz = vizSupport.enableUnityVisualization(sim, task, sc_list, saveFile=str(save),
+                                              trueOrbitColorList=[off] * len(sc_list),
+                                              lightList=lights)
+    _LIVE_LIGHTS[:] = lights[0]  # VizSpacecraftData.lightList holds raw Light* pointers
+    name_c = client_sc.ModelTag
 
-    # --- models ---------------------------------------------------------------
+    # --- models (no rotation: every OBJ is in its body frame, A axes) ----------
     vizSupport.createCustomModel(viz, MODEL_FILES["client"], simBodiesToModify=[name_c],
                                  offset=list(-com))
-    vizSupport.createCustomModel(viz, MODEL_FILES["servicer"], simBodiesToModify=[name_s])
-    for n in ARM_BODIES:
-        if n in extra_bodies:
-            vizSupport.createCustomModel(viz, MODEL_FILES[n], simBodiesToModify=[n])
-    mods = [n for n in MODULE_BODIES if n in extra_bodies]
-    if mods:
-        vizSupport.createCustomModel(viz, MODEL_FILES["module"], simBodiesToModify=mods)
-    for n in OVERLAYS:
-        if n in extra_bodies:
-            vizSupport.createCustomModel(viz, MODEL_FILES[n], simBodiesToModify=[n])
-    if "keepout" in extra_bodies:
-        vizSupport.createCustomModel(viz, MODEL_FILES["keepout_sphere"], simBodiesToModify=["keepout"])
+    groups = {}
+    for n in names:
+        groups.setdefault(model_key(n), []).append(n)
+    for key, members in groups.items():
+        vizSupport.createCustomModel(viz, MODEL_FILES[key], simBodiesToModify=members)
 
-    # --- approach cone: tip at M(2,7), axis -z_A, on the client body ----------
-    tip_B = module_center(*c["target"], cfg) - com
-    vizSupport.createConeInOut(viz, fromBodyName=name_c, toBodyName=name_s,
-                               coneColor=[80, 200, 255, 60], isKeepIn=True,
-                               position_B=list(tip_B), normalVector_B=[0.0, 0.0, -1.0],
-                               incidenceAngle=np.radians(c["cone_half_deg"]),
-                               coneHeight=float(c["cone_len_m"]), coneName="Approach cone")
-
-    # --- cameras ---------------------------------------------------------------
-    # 1 wide: on the client, back (servicer) side, looking at the CoM
-    p_wide = np.array([30.0, -55.0, -45.0])
-    vizSupport.createStandardCamera(viz, spacecraftName=name_c, setMode=1,
-                                    pointingVector_B=list(-p_wide / np.linalg.norm(p_wide)),
-                                    position_B=list(p_wide), fieldOfView=np.radians(40),
-                                    displayName=CAMERAS[0])
-    # 2 servicer front camera (+x_S), at the stereo camera on the front face
-    vizSupport.createStandardCamera(viz, spacecraftName=name_s, setMode=1,
-                                    pointingVector_B=[1.0, 0.0, 0.0], position_B=[0.75, 0.3, 0.3],
-                                    fieldOfView=np.radians(50), displayName=CAMERAS[1])
-    # 3 arm close-up: side-on to the arm plane (y_S = 0) from -y_S, covering the
-    # rack (x_S = -0.6) to the array (x_S = 2.6)
-    vizSupport.createStandardCamera(viz, spacecraftName=name_s, setMode=1,
-                                    pointingVector_B=[0.05, 1.0, -0.05], position_B=[1.0, -4.6, 0.4],
-                                    fieldOfView=np.radians(60), displayName=CAMERAS[2])
+    # --- cameras on the client (positions/targets in A, viz.cameras) -----------
+    for display, key in zip(CAMERAS, ("wide", "gantry", "closeup")):
+        cam = cfg["viz"]["cameras"][key]
+        pos, pnt = _look(cam, com)
+        vizSupport.createStandardCamera(viz, spacecraftName=name_c, setMode=1,
+                                        pointingVector_B=pnt, position_B=pos,
+                                        fieldOfView=np.radians(cam["fov_deg"]),
+                                        displayName=display)
 
     # --- settings ---------------------------------------------------------------
     s = viz.settings
     s.ambient = cfg["viz"]["ambient"]
     s.showSpacecraftLabels = -1        # no per-body label switch in 2.12.2
     s.orbitLinesOn = -1                # a 7000 km orbit line cuts through close-ups
-    s.trueTrajectoryLinesOn = 1
-    s.truePathRelativeBody = name_c    # servicer trail relative to the client ...
-    s.truePathRotatingFrame = f"earth {name_c}"  # ... in the rotating (Hill-like) frame
+    s.trueTrajectoryLinesOn = -1
+    s.showLightLabels = -1
     s.showMissionTime = 1
     s.forceStartAtSpacecraftLocalView = 1
     viz.vizEventDialogs.clear()

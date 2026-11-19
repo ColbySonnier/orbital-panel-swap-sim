@@ -14,9 +14,7 @@ G = cfg["gantry"]
 N_STAGES = {k: len(G[f"fork_{k}_stages"]) for k in ("W", "F")}
 GANTRY_KEYS = {"bridge", "carriage", "fork_W_head", "fork_F_head",
                *(f"fork_{k}_stage{i}" for k in ("W", "F") for i in range(1, N_STAGES[k] + 1))}
-# servicer / arm / keep-out stay until task G3 removes them
-KEYS = {"client", "module", "servicer", "tool", "overlay_red", "overlay_green", "keepout_sphere",
-        *(f"arm_link_{i}" for i in range(1, 7)), *GANTRY_KEYS}
+KEYS = {"client", "module", "overlay_red", "overlay_green", *GANTRY_KEYS}
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -53,18 +51,6 @@ def extents(name, group=None):
 
 def count_module_groups(name):
     return sum(1 for g in read_obj(name) if g.startswith("module_"))
-
-
-def link_lengths():
-    """Joint-to-joint offset of each link along its +x axis (fk joint layout)."""
-    from models.build_models import link_spans
-    return link_spans(cfg)
-
-
-def extent_along_axis(name):
-    """Length of the link's joint-to-joint span member along its +x axis."""
-    g = read_obj(name).get("span")
-    return 0.0 if g is None else g[:, 0].max() - g[:, 0].min()
 
 
 def test_model_keys():
@@ -116,7 +102,7 @@ def test_module_cells_on_front_and_fixture_on_back():
     assert abs(g["panel"][:, 2].max() - 0.025) < 0.005
     tip = g["fixture"][:, 2].min()
     expect = -(cfg["client"]["module_thick_m"] / 2 + cfg["client"]["grapple_gap_m"])
-    assert abs(tip - expect) < 0.005  # fixture tip at the tool point
+    assert abs(tip - expect) < 0.005  # fixture tip at the fork grapple point
     assert np.abs(g["fixture"][:, :2]).max() < 0.15  # centered on the back
 
 
@@ -142,58 +128,6 @@ def test_client_layout():
     bus = g["bus"]
     assert np.allclose((bus.max(0) + bus.min(0)) / 2, [0, 0, -cfg["client"]["bus_offset_m"]], atol=0.05)
     assert np.allclose(bus.max(0) - bus.min(0), [cfg["client"]["bus_size_m"]] * 3, atol=0.05)
-
-
-def test_servicer_bus_and_pedestal():
-    g = read_obj("servicer")
-    bus = g["bus"]
-    assert np.allclose(bus.max(0) - bus.min(0), cfg["servicer"]["size_m"], atol=0.02)
-    assert np.allclose((bus.max(0) + bus.min(0)) / 2, 0, atol=0.01)
-    ped = g["pedestal"]
-    assert abs(ped[:, 0].min() - cfg["servicer"]["size_m"][0] / 2) < 0.02
-    assert ped[:, 0].max() <= cfg["arm"]["shoulder_m"][0] + 0.01
-
-
-def test_servicer_rack_matches_config():
-    r = cfg["arm"]["rack"]
-    g = read_obj("servicer")
-    for side in (1, -1):
-        rails = g["rack_top" if side > 0 else "rack_bottom"]
-        z = side * rails[:, 2]
-        n = 4 if side > 0 else 2
-        outer = r["z0_m"] + r["dz_m"] * (n - 1)
-        assert z.min() >= cfg["servicer"]["size_m"][2] / 2 - 0.01
-        assert z.max() >= outer  # rails reach past the outermost slot
-        # rails frame the 2 m panel footprint centered at x_m
-        assert abs((rails[:, 0].max() + rails[:, 0].min()) / 2 - r["x_m"]) < 0.05
-
-
-def test_arm_links_meet():  # Review Focus 2
-    from models.build_models import EE_LEN
-    L = link_lengths()
-    assert L == pytest.approx([0.0, *cfg["arm"]["links_m"][:2], 0.0, 0.0, cfg["arm"]["links_m"][2]])
-    for i, Li in enumerate(L):
-        name = f"arm_link_{i + 1}"
-        if i == 5:
-            # link 6 runs wrist -> mating flange; the tool's effector shell runs
-            # flange -> tool point. Together they span L6 joint to tool point.
-            eff = read_obj("tool")["effector"][:, 0]
-            assert abs(eff.max()) < 0.002 and abs(eff.min() + EE_LEN) < 0.002
-            assert abs(extent_along_axis(name) + (eff.max() - eff.min()) - Li) < 0.02
-            assert abs(read_obj(name)["span"][:, 0].max() - (Li - EE_LEN)) < 0.002  # parts meet
-            continue
-        assert abs(extent_along_axis(name) - Li) < 0.02, name
-        if Li > 0:  # span starts at the link's own joint
-            assert abs(read_obj(name)["span"][:, 0].min()) < 0.02
-        else:       # joint housing centered on the joint
-            v = all_verts(name)
-            assert np.all(np.abs((v.max(0) + v.min(0)) / 2) < 0.02), name
-
-
-def test_tool_at_tool_point():
-    v = all_verts("tool")
-    assert v[:, 0].max() < 0.01  # nothing past the tool point along +x
-    assert v[:, 0].min() > -cfg["arm"]["links_m"][2]
 
 
 def test_assets_licensed():
@@ -226,13 +160,6 @@ def _connected(model, tol=1e-3):
     return len(seen) == len(boxes)
 
 
-def test_tool_and_links_are_one_assembly():
-    from models.build_models import build_link, build_tool
-    assert _connected(build_tool(cfg))
-    for i in range(1, 7):
-        assert _connected(build_link(i, cfg)), i
-
-
 def _point_obb_dist(P, c, R, h):
     """Distance from points (n, 3) to the box (center c, axes = columns of R, half h)."""
     q = (P - c) @ R
@@ -242,14 +169,13 @@ def _point_obb_dist(P, c, R, h):
 
 @pytest.mark.slow
 def test_truss_clears_carried_modules():
-    """Steps 6.5 (pull) and 6.9 (insert): the module_target and spare_3 boxes
-    (visual size) clear every truss capsule near the target slot."""
+    """Gantry steps pull and drop_in: the module_target and spare_0 boxes
+    (visual size, A axes) clear every truss capsule near the target slot."""
     from models.build_models import module_visual_m, truss_members
     from src.geometry import module_center
-    from src.modules.arm_motion import SwapSequence, berth_pose_A
-    seq = SwapSequence(cfg)
-    pos, dcm_AS = berth_pose_A(cfg)
-    h = np.array([cfg["client"]["module_thick_m"] / 2, *[module_visual_m(cfg) / 2] * 2])
+    from src.modules.gantry_motion import GantrySequence
+    seq = GantrySequence(cfg)
+    h = np.array([*[module_visual_m(cfg) / 2] * 2, cfg["client"]["module_thick_m"] / 2])
     tgt = module_center(*cfg["client"]["target"], cfg)
     caps = []
     for _, p0, p1, r in truss_members(cfg):
@@ -261,21 +187,19 @@ def test_truss_clears_carried_modules():
     assert len(caps) > 20
     pts = np.vstack([c[0] for c in caps])
     rad = np.concatenate([np.full(len(c[0]), c[1]) for c in caps])
-    ts = np.arange(0.0, seq.duration, 0.5)
-    checked = {"6.5": 0, "6.9": 0}
-    for t in ts:
+    checked = {"pull": 0, "drop_in": 0}
+    for t in np.arange(0.0, seq.duration, 0.5):
         f = seq.at(t)
         if f.step not in checked:
             continue
-        for body in ("module_target", "spare_3"):
-            c_S, R_SM = f.bodies[body]
-            c_A = dcm_AS @ c_S + pos
-            R_AM = dcm_AS @ R_SM
-            gap = _point_obb_dist(pts, c_A, R_AM, h) - rad
-            assert gap.min() > 0.0005, (f.step, t, body, gap.min())
+        body = "module_target" if f.step == "pull" else "spare_0"
+        c_A, R_A = f.bodies[body]
+        if np.allclose(c_A, tgt):  # seated (the seated panel sits in its slot by design)
+            continue
+        gap = _point_obb_dist(pts, c_A, R_A, h) - rad
+        assert gap.min() > 0.0005, (f.step, t, body, gap.min())
         checked[f.step] += 1
     assert min(checked.values()) > 50
-
 
 # --- gantry models (task G2) --------------------------------------------------------
 

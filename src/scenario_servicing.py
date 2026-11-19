@@ -1,18 +1,27 @@
-r"""Servicer demo: the full Basilisk scenario and its Vizard replay.
+r"""Rail-gantry panel swap: the full Basilisk scenario and its Vizard replay.
 
-    python -m src.scenario_servicing [--full-timeline] [--no-viz]
+    python -m src.scenario_servicing [--full-timeline] [--no-viz] [--outdir DIR]
 
-Tasks (one process; at equal times, higher priority runs first):
-  env      1 s     SPICE (Earth, Sun; zero base Earth)
-  dynFar   1 s  \  client + servicer (Earth + Sun point-mass gravity) and the
-  dynNear  0.1 s/  servicer's extForceTorque. Exactly one is enabled: near
-                   below dyn.near_m, far again above far_hysteresis x near_m.
-  fsw      dyn.fsw_s  eclipse, then Glue: frames, power + health monitor,
-                   MissionManager, force command, attitudes, rigid link, mass.
-  viz      viz.rate_s  BodyWriter (extra-body states + HUD), then vizInterface.
+Tasks (one process, all at run.dt_s; at equal times higher priority runs first):
+  env   SPICE (Earth, Sun; zero base Earth)
+  dyn   client Spacecraft (Earth + Sun point-mass gravity). The client is the
+        only Spacecraft: no servicer, no forces.
+  fsw   eclipse, then Glue: power + health monitor, the mission phase machine
+        and the gantry sequence clock.
+  viz   BodyWriter (inertial states of every gantry/panel/overlay body + HUD),
+        then vizInterface.
 
-Frames: A is inertial (the client body frame, set from the Sun direction at
-t = 0 with geometry.array_dcm and held); H is Hill about the client CoM.
+Frames: A is the array frame (geometry.array_dcm from the Sun direction at
+t = 0), held inertially; the client body frame B = A, origin at the CoM.
+Every extra body: r_N = r_client + dcm_NA @ (p_A - com_A), dcm_NB = dcm_NA @ R_A.
+
+Mission flow (spec table):
+  0 Monitoring   until service_request (red overlay on)
+  1 Go / no-go   for holds_s.go
+  2 Gantry swap  sequence clock 0 -> start of step roll_home (retract done)
+  3 Checkout     gantry holds still, until checkout_pass (green overlay on)
+  4 Return       the sequence clock resumes: roll home to the end
+  5 Done         hold run.home_tail_s, then stop
 """
 import argparse
 import gc
@@ -22,334 +31,233 @@ from pathlib import Path
 
 import numpy as np
 from Basilisk.architecture import messaging, sysModel
-from Basilisk.simulation import eclipse, extForceTorque, spacecraft
+from Basilisk.simulation import eclipse, spacecraft
 from Basilisk.utilities import (RigidBodyKinematics as rbk, SimulationBaseClass,
                                 macros, orbitalMotion, simIncludeGravBody)
 
 from src.config import load_config
-from src.geometry import (array_dcm, client_mass_props, hill_dcm, module_center,
-                          module_ids)
-from src.modules.arm_motion import SwapSequence, _log, berth_pose_A, fk
+from src.geometry import array_dcm, client_mass_props, module_center, module_ids
+from src.modules.gantry_motion import GantrySequence
 from src.modules.health_monitor import (HealthMonitor, PowerState, array_total,
                                         module_powers)
-from src.modules.mission_manager import PHASES, MissionManager
-from src.viz_setup import module_dcm_NO
 
 REPO = Path(__file__).resolve().parents[1]
+
+PHASES = ["Monitoring", "Go / no-go", "Gantry swap", "Checkout", "Return", "Done"]
+STEP_LABELS = {"roll_out": "Roll out", "align_waste": "Align waste bay", "grab": "Grab",
+               "pull": "Pull", "shift": "Shift", "drop_in": "Drop in", "latch": "Latch",
+               "retract": "Retract", "roll_home": "Roll home"}
+TRACE_BODIES = ("module_target", "spare_0", "overlay_red", "overlay_green", "bridge_B")
 
 
 @dataclass
 class RunLog:
-    """Time series, one row per glue update (every max(dyn.fsw_s, dyn dt))."""
+    """Time series, one row per glue update (every run.dt_s)."""
     t: np.ndarray
-    rel_H: np.ndarray          # (N, 6) servicer rel. client CoM, Hill
-    rel_A: np.ndarray          # (N, 6) servicer rel. array center, A
     phase: np.ndarray
-    dv_used: np.ndarray        # m/s
+    step: list                 # HUD gantry step label
+    seq_t: np.ndarray          # gantry sequence clock (s)
     array_power: np.ndarray    # W
     module_ratios: np.ndarray  # (N, n_modules) power / median
     module_ids: list
-    arm_q: np.ndarray          # (N, 6) rad, NaN when the arm is idle
-    sub: list
-    overlay: list
+    bridge_x: np.ndarray       # bridge B x in A (m)
+    carriage_y: np.ndarray     # carriage y in A (m)
+    fork_z: np.ndarray         # (N, 2) fork W, fork F tip z in A (m)
+    overlay: list              # None | "red" | "green"
     events: list               # (t, kind, module)
     phase_start: dict          # phase -> first sim time (s)
-    mass: np.ndarray           # servicer hub mass (kg)
+    seq_steps: list            # [(seq_t start, step)]
+    seq_duration: float
+    pre_fault_power: float
+    trace: dict = field(repr=False, default_factory=dict)  # replay-message read-backs
     cfg: dict = field(repr=False, default=None)
     viz_settings: dict = field(default_factory=dict)  # snapshot; the viz module is released
     wall_s: float = 0.0
     replay: Path | None = None
 
 
-def _exp(w):
-    """Rotation matrix of rotation vector w."""
-    th = float(np.linalg.norm(w))
-    if th < 1e-12:
-        return np.eye(3)
-    k = w / th
-    K = np.array([[0, -k[2], k[1]], [k[2], 0, -k[0]], [-k[1], k[0], 0]])
-    return np.eye(3) + np.sin(th) * K + (1 - np.cos(th)) * K @ K
-
-
-def _smooth(s):
-    s = min(max(s, 0.0), 1.0)
-    return s * s * (3 - 2 * s)
-
-
 class Glue(sysModel.SysModel):
-    """FSW-rate glue between Basilisk and the mission modules."""
+    """FSW-rate glue: power + health monitor, phase machine, gantry clock."""
 
-    def __init__(self, cfg, client, servicer, sun_msg, eclipse_msg, force_msg, swap):
+    def __init__(self, cfg, eclipse_msg, seq):
         super().__init__()
         self.ModelTag = "glue"
-        self.cfg = cfg
-        self.client, self.servicer = client, servicer
-        self.sun_msg, self.eclipse_msg, self.force_msg = sun_msg, eclipse_msg, force_msg
-        self.swap = swap
-        self.mm = MissionManager(cfg, geo={"swap": swap})
+        self.cfg, self.eclipse_msg, self.seq = cfg, eclipse_msg, seq
         self.rng = np.random.default_rng(cfg["seed"])
         self.pstate, self.monitor = PowerState(), HealthMonitor(cfg)
         self.target = tuple(cfg["client"]["target"])
-        _, self.com, _ = client_mass_props(cfg, set())
-        self.mass0 = float(cfg["servicer"]["mass_kg"])
-        self.m_mod = float(cfg["client"]["module_mass_kg"])
-        ev = {name: float(t) for t, name in swap.events}
-        self.t_capture, self.t_release_tool = ev["capture"], ev["release_tool"]
-        self.dcm_AN = None
-        self.dcm_AS_berth = berth_pose_A(cfg)[1]
-        self.cmd = None
-        self.lock = None
-        self.installed = False
-        self.svc = self.passed = self.failed = False
-        self.home_t = None
-        self.range = None
-        self.pre_fault_power = None
-        self._att = {"mode": None, "t0": 0.0, "start": np.eye(3)}
-        self.dcm_SN = np.eye(3)
-        self.phase_start = {}
-        self.L = {k: [] for k in ("t", "rel_H", "rel_A", "phase", "dv", "power", "ratios",
-                                  "q", "sub", "overlay", "mass")}
+        self.ids = module_ids(cfg)
+        self.dt = float(cfg["run"]["dt_s"])
+        self.t_hold = next(t for t, n in seq.steps if n == "roll_home")  # retract done
+        self.phase, self.phase_start = 0, {0: 0.0}
+        self.svc = self.passed = self.failed = self.installed = False
+        self.fired = set()
+        self.seq_t, self.frame = 0.0, seq.at(0.0)
+        self.overlay = None
+        self.step_label = "Parked"
+        self.pre_fault = []
         self.events = []
-        self.fsw_s = float(cfg["dyn"]["fsw_s"])
-        self.blend_s = float(cfg["viz"]["blend_s"])
-        self.period_ns = macros.sec2nano(self.fsw_s)  # run() sets max(fsw_s, dyn dt)
-        self._pos = None  # servicer state objects exist only after init
+        self.L = {k: [] for k in ("t", "phase", "step", "seq_t", "power", "ratios",
+                                  "bx", "cy", "fz", "overlay")}
 
-    def _bind_states(self):
-        s, dm = self.servicer.hub, self.servicer.dynManager
-        self._pos = dm.getStateObject(s.nameOfHubPosition)
-        self._vel = dm.getStateObject(s.nameOfHubVelocity)
-        self._sig = dm.getStateObject(s.nameOfHubSigma)
-        self._omg = dm.getStateObject(s.nameOfHubOmega)
+    @property
+    def pre_fault_power(self):
+        return float(np.mean(self.pre_fault)) if self.pre_fault else None
 
-    # --- helpers -------------------------------------------------------------
+    def _enter(self, ph, t):
+        self.phase = ph
+        self.phase_start.setdefault(ph, t)
 
-    def _init_frames(self, r_c, v_c):
-        sun = np.array(self.sun_msg.read().PositionVector) - r_c
-        self.dcm_AN = array_dcm(sun / np.linalg.norm(sun), r_c, v_c)
-        c = self.client.hub
-        dm = self.client.dynManager
-        dm.getStateObject(c.nameOfHubSigma).setState(
-            [[x] for x in rbk.C2MRP(self.dcm_AN)])
-        dm.getStateObject(c.nameOfHubOmega).setState([[0.0], [0.0], [0.0]])
+    def _clock(self, t):
+        """Phase transitions and the gantry sequence time for this tick."""
+        ph, ps = self.phase, self.phase_start
+        if ph == 0 and self.svc:
+            self._enter(1, t)
+        if self.phase == 1 and t - ps[1] >= self.cfg["holds_s"]["go"] - 1e-9:
+            self._enter(2, t)
+        if self.phase == 3 and self.passed:
+            self._enter(4, t)
+        if self.phase == 2:
+            s = t - ps[2]
+            if s >= self.t_hold:
+                self._enter(3, t)
+                return self.t_hold
+            return s
+        if self.phase == 3:
+            return self.t_hold
+        if self.phase == 4:
+            s = self.t_hold + (t - ps[4]) + self.dt
+            if s >= self.seq.duration:
+                self._enter(5, t)
+                return self.seq.duration
+            return s
+        if self.phase == 5:
+            return self.seq.duration
+        return 0.0
 
-    def _target_dcm_SN(self, mode, r_c, v_c, r_s):
-        if mode == "berth":
-            return self.dcm_AS_berth.T @ self.dcm_AN
-        x = r_c - r_s
-        x /= np.linalg.norm(x)
-        h = np.cross(r_c, v_c)
-        z = h - (h @ x) * x
-        z /= np.linalg.norm(z)
-        return np.vstack([x, np.cross(z, x), z])
-
-    def _attitude(self, t, cmd, r_c, v_c, r_s):
-        mode = "berth" if (4 <= cmd.phase <= 7 or (cmd.phase == 8 and cmd.frame == "A")) else "point"
-        a = self._att
-        if a["mode"] is None:
-            a["mode"], a["t0"], a["start"] = mode, -self.blend_s, self.dcm_SN
-        elif mode != a["mode"]:
-            a["mode"], a["t0"], a["start"] = mode, t, self.dcm_SN.copy()
-        tgt = self._target_dcm_SN(mode, r_c, v_c, r_s)
-        s = _smooth((t - a["t0"]) / self.blend_s)
-        if s >= 1.0:
-            dcm = tgt
-        else:
-            D = tgt @ a["start"].T
-            dcm = _exp(s * _log(D)) @ a["start"]
-        self.dcm_SN = dcm
-        self._sig.setState([[x] for x in rbk.C2MRP(dcm)])
-        self._omg.setState([[0.0], [0.0], [0.0]])
-
-    def servicer_mass(self, cmd):
-        """+module mass while the damaged module is held and the spare is still
-        aboard (capture .. release_tool); otherwise the base mass."""
-        if cmd.phase == 6 and cmd.arm_t is not None \
-                and self.t_capture <= cmd.arm_t < self.t_release_tool:
-            return self.mass0 + self.m_mod
-        return self.mass0
-
-    # --- step -------------------------------------------------------------------
+    def _install(self, t):
+        self.installed = True
+        self.pstate.open_switch.discard(self.target)
+        self.pstate.replaced.add(self.target)
+        self.monitor.reset(self.target)
+        self.monitor.start_checkout(self.target, t, self.cfg["holds_s"]["checkout"])
 
     def UpdateState(self, t_ns):
-        # Basilisk integrates [t - dt, t] with the force it reads at t, so a
-        # command must be held for a whole dynamics step: with 1 s far-range
-        # dynamics the glue acts only on whole seconds (period_ns).
-        if t_ns % self.period_ns:
-            return
         t = t_ns * 1e-9
-        cs = self.client.scStateOutMsg.read()
-        r_c, v_c = np.array(cs.r_BN_N), np.array(cs.v_BN_N)
-        if self.dcm_AN is None:
-            self._init_frames(r_c, v_c)
-            self._bind_states()
-        dcm_AN = self.dcm_AN
-        if self.lock is not None:  # rigid arm link: co-move with the array
-            r_s = r_c + dcm_AN.T @ (self.lock - self.com)
-            v_s = v_c.copy()
-            self._pos.setState([[x] for x in r_s])
-            self._vel.setState([[x] for x in v_s])
-        else:
-            ss = self.servicer.scStateOutMsg.read()
-            r_s, v_s = np.array(ss.r_BN_N), np.array(ss.v_BN_N)
-        dcm_HN = hill_dcm(r_c, v_c)
-        n = np.linalg.norm(np.cross(r_c, v_c)) / (r_c @ r_c)
-        d, dv = r_s - r_c, v_s - v_c
-        rH = dcm_HN @ d
-        rel_H = np.concatenate([rH, dcm_HN @ dv - np.cross([0.0, 0.0, n], rH)])
-        rel_A = np.concatenate([dcm_AN @ d + self.com, dcm_AN @ dv])
-        self.range = float(np.linalg.norm(d))
-
         sun_factor = float(self.eclipse_msg.read().shadowFactor)
         powers = module_powers(t, self.cfg, self.pstate, self.rng, strike=True,
                                sun_factor=sun_factor)
-        events = self.monitor.step(t, powers)
-        for e in events:
+        for e in self.monitor.step(t, powers):
             self.events.append((t, e.kind, tuple(e.module)))
             if e.kind == "failed":
                 self.pstate.open_switch.add(e.module)
-            if e.kind == "service_request":
-                self.svc = True
             if tuple(e.module) == self.target:
+                self.svc |= e.kind == "service_request"
                 self.passed |= e.kind == "checkout_pass"
                 self.failed |= e.kind == "checkout_fail"
-        cmd = self.mm.update(t, rel_H, rel_A, events, dcm_HN, dcm_AN)
-        if cmd.module_installed and not self.installed:
-            self.installed = True
-            self.pstate.open_switch.discard(self.target)
-            self.pstate.replaced.add(self.target)
-            self.monitor.reset(self.target)
-            self.monitor.start_checkout(self.target, t, self.cfg["holds_s"]["checkout"])
-        self.phase_start.setdefault(cmd.phase, t)
-        if cmd.phase == 9 and self.home_t is None:
-            self.home_t = t
 
-        pl = messaging.CmdForceInertialMsgPayload()
-        pl.forceRequestInertial = list(cmd.force_N)
-        self.force_msg.write(pl, t_ns, self.moduleID)
-        m = self.servicer_mass(cmd)
-        if m != self.servicer.hub.mHub:
-            self.servicer.hub.mHub = m
-        self._attitude(t, cmd, r_c, v_c, r_s)
-        if cmd.thrusters_inhibited:
-            if self.lock is None:
-                self.lock = rel_A[:3].copy()
+        s = self._clock(t)
+        self.seq_t = s
+        for te, name in self.seq.events:
+            if name not in self.fired and te <= s + 1e-9:
+                self.fired.add(name)
+                self.events.append((t, name, self.target))
+                if name == "latched":
+                    self._install(t)
+        self.frame = f = self.seq.at(s)
+        self.overlay = "green" if self.passed else ("red" if self.svc else None)
+        if self.phase in (0, 1, 5):
+            self.step_label = "Parked"
+        elif self.phase == 3:
+            self.step_label = "Retracted, holding"
         else:
-            self.lock = None
-        self.cmd = cmd
+            self.step_label = STEP_LABELS.get(f.step, f.step)
 
         tot = array_total(powers)
         if t < self.cfg["power"]["strike_t_s"]:
-            self.pre_fault_power = tot if self.pre_fault_power is None else self.pre_fault_power
+            self.pre_fault.append(tot)
         med = float(np.median(list(powers.values())))
+        b = self.seq.bridge
         L = self.L
-        L["t"].append(t); L["rel_H"].append(rel_H); L["rel_A"].append(rel_A)
-        L["phase"].append(cmd.phase); L["dv"].append(self.mm.dv_used); L["power"].append(tot)
+        L["t"].append(t); L["phase"].append(self.phase); L["step"].append(self.step_label)
+        L["seq_t"].append(s); L["power"].append(tot)
         L["ratios"].append([powers[k] / med if med > 0 else np.nan for k in self.ids])
-        L["q"].append(self.swap.at(cmd.arm_t).q if cmd.arm_t is not None else np.full(6, np.nan))
-        L["sub"].append(cmd.sub); L["overlay"].append(cmd.overlay); L["mass"].append(m)
-
-    @property
-    def ids(self):
-        if not hasattr(self, "_ids"):
-            self._ids = module_ids(self.cfg)
-        return self._ids
+        L["bx"].append(f.bridge_x[b]); L["cy"].append(f.carriage_y)
+        L["fz"].append([f.fork_z["W"], f.fork_z["F"]]); L["overlay"].append(self.overlay)
 
 
 class BodyWriter(sysModel.SysModel):
-    """Viz-rate writer: inertial states of the arm, module, overlay and
-    keep-out bodies, plus the HUD text."""
+    """Viz-rate writer: inertial states of every gantry, panel and overlay body
+    (client pose o A-frame pose), the HUD text, and a read-back trace of the
+    written messages for the tests."""
 
-    def __init__(self, cfg, glue, msgs, viz=None, hud=None):
+    def __init__(self, cfg, client, glue, msgs, viz=None, hud=None):
         super().__init__()
         self.ModelTag = "bodyWriter"
-        self.cfg, self.g, self.msgs, self.viz, self.hud = cfg, glue, msgs, viz, hud
-        swap = glue.swap
-        self.frame0, self.frame_end = swap.at(0.0), swap.at(swap.duration)
-        self.spare = f"spare_{cfg['arm']['rack']['spare_slot']}"
-        self.tgt_A = module_center(*cfg["client"]["target"], cfg)
+        self.cfg, self.client, self.g, self.msgs = cfg, client, glue, msgs
+        self.viz, self.hud = viz, hud
+        _, self.com, _ = client_mass_props(cfg, set())
+        self.slot_A = module_center(*cfg["client"]["target"], cfg)
+        self.park_A = self.slot_A + np.array([0.0, 0.0, -float(cfg["viz"]["park_m"])])
         self.p = messaging.SCStatesMsgPayload()
-        drop = 100.0 * (1 - cfg["power"]["strike_frac_remaining"])
         r, c = cfg["client"]["target"]
-        self.svc_text = f"M({r},{c}) power down {drop:.0f}%: service requested"
         self.mod_name = f"M({r},{c})"
+        drop = 100.0 * (1 - cfg["power"]["strike_frac_remaining"])
+        self.svc_text = f"{self.mod_name} power down {drop:.0f}%: service requested"
+        self.trace = {"t": [], "r_c": [], "sigma_c": [], "hud": [],
+                      **{n: {"r": [], "sigma": []} for n in TRACE_BODIES}}
 
-    def _write(self, name, r_N, dcm_NO, v_N, t_ns):
-        if name not in self.msgs:
-            return
+    def _write(self, name, r_N, dcm_NB, v_N, t_ns):
         p = self.p
         p.r_BN_N = list(r_N)
         p.r_CN_N = list(r_N)
         p.v_BN_N = list(v_N)
         p.v_CN_N = list(v_N)
-        p.sigma_BN = list(rbk.C2MRP(dcm_NO.T))
+        p.sigma_BN = list(rbk.C2MRP(dcm_NB.T))
         self.msgs[name].write(p, t_ns, self.moduleID)
 
     def UpdateState(self, t_ns):
-        g, cmd = self.g, self.g.cmd
-        if cmd is None or g.dcm_AN is None:
-            return
-        cs, ss = g.client.scStateOutMsg.read(), g.servicer.scStateOutMsg.read()
+        g = self.g
+        cs = self.client.scStateOutMsg.read()
         r_c, v_c = np.array(cs.r_BN_N), np.array(cs.v_BN_N)
-        r_s, v_s = np.array(ss.r_BN_N), np.array(ss.v_BN_N)
-        dcm_NA = g.dcm_AN.T
-        dcm_NS = rbk.MRP2C(np.array(ss.sigma_BN)).T
-        ph, arm_t = cmd.phase, cmd.arm_t
-        if arm_t is None:
-            fr = self.frame0 if ph < 6 else self.frame_end
-            arm_t = 0.0 if ph < 6 else g.swap.duration
-        else:
-            fr = g.swap.at(arm_t)
-        # arm links and tool
-        poses = fk(fr.q, self.cfg)
-        for i in range(1, 7):
-            p, R = poses[i]
-            self._write(f"arm_link_{i}", r_s + dcm_NS @ p, dcm_NS @ R, v_s, t_ns)
-        p, R = poses[7]
-        self._write("tool", r_s + dcm_NS @ p, dcm_NS @ R, v_s, t_ns)
-        # modules: seated ones ride the client, the rest the servicer
-        seat_r = r_c + dcm_NA @ (self.tgt_A - g.com)
-        for name, (c_S, dcm_SM) in fr.bodies.items():
-            seated = ((name == "module_target" and (ph < 6 or arm_t < g.t_capture))
-                      or (name == self.spare and (ph > 6 or arm_t >= g.t_release_tool)))
-            if seated:
-                self._write(name, seat_r, dcm_NA, v_c, t_ns)
-            else:
-                self._write(name, r_s + dcm_NS @ c_S, module_dcm_NO(dcm_NS, dcm_SM), v_s, t_ns)
-        park = r_c - self.cfg["viz"]["park_m"] * r_c / np.linalg.norm(r_c)
+        dcm_NA = rbk.MRP2C(np.array(cs.sigma_BN)).T   # client B = A
+        pose = lambda p_A: r_c + dcm_NA @ (np.asarray(p_A) - self.com)
+        for name, (p_A, R_A) in g.frame.bodies.items():
+            if name in self.msgs:
+                self._write(name, pose(p_A), dcm_NA @ R_A, v_c, t_ns)
         for color in ("red", "green"):
-            on = cmd.overlay == color
-            self._write(f"overlay_{color}", seat_r if on else park, dcm_NA, v_c, t_ns)
-        center = r_c - dcm_NA @ g.com
-        self._write("keepout", center if 3 <= ph <= 8 else park, dcm_NA, v_c, t_ns)
+            on = g.overlay == color
+            self._write(f"overlay_{color}", pose(self.slot_A if on else self.park_A),
+                        dcm_NA, v_c, t_ns)
+        text = self.hud_text()
+        tr = self.trace
+        tr["t"].append(t_ns * 1e-9); tr["r_c"].append(list(cs.r_BN_N))
+        tr["sigma_c"].append(list(cs.sigma_BN)); tr["hud"].append(text)
+        for n in TRACE_BODIES:
+            m = self.msgs[n].read()
+            tr[n]["r"].append(list(m.r_BN_N)); tr[n]["sigma"].append(list(m.sigma_BN))
         if self.viz is not None and self.hud is not None:
-            self.hud.displayString = self.hud_text(t_ns * 1e-9, cmd, r_c, v_c, r_s, v_s)
+            self.hud.displayString = text
             self.viz.vizEventDialogs.append(self.hud)
 
-    def hud_text(self, t, cmd, r_c, v_c, r_s, v_s):
+    def hud_text(self):
         g = self.g
-        d = r_s - r_c
-        rng = float(np.linalg.norm(d))
-        closing = -float(d @ (v_s - v_c)) / max(rng, 1e-9)
-        sub = cmd.sub
-        if sub == "timeout":
-            sub = "over time"
-        lines = [f"Phase {cmd.phase}: {cmd.phase_name}" + (f"  ({sub})" if sub else ""),
-                 f"Range {rng:,.1f} m   closing {100 * closing:+.1f} cm/s",
-                 f"Delta-v used {g.mm.dv_used:.2f} m/s"]
-        if g.L["power"]:
-            pct = 100 * g.L["power"][-1] / g.pre_fault_power
-            lines.append(f"Array power {g.L['power'][-1] / 1000:.1f} kW ({pct:.1f}% of nominal)")
+        lines = [f"Phase {g.phase}: {PHASES[g.phase]}", f"Gantry: {g.step_label}"]
+        if g.L["power"] and g.pre_fault_power:
+            w = g.L["power"][-1]
+            lines.append(f"Array power {w / 1000:.1f} kW ({100 * w / g.pre_fault_power:.1f}% of pre-fault)")
         if g.failed:
             lines.append(f"{self.mod_name} CHECKOUT FAILED")
         elif g.passed:
             lines.append("Array power restored")
+        elif g.installed:
+            lines.append(f"New {self.mod_name} latched: checkout running")
         elif g.svc:
             lines.append(self.svc_text)
         return "\n".join(lines)
 
 
-def _initial_states(cfg):
+def _initial_state(cfg):
     o = cfg["orbit"]
     mu = o["mu_km3s2"] * 1e9
     oe = orbitalMotion.ClassicElements()
@@ -359,25 +267,45 @@ def _initial_states(cfg):
     oe.Omega = np.radians(o["raan_deg"])
     oe.omega = 0.0
     oe.f = np.radians(o["arg_lat_deg"])
-    r_c, v_c = (np.array(x, float) for x in orbitalMotion.elem2rv(mu, oe))
-    # servicer on the same circular orbit, phased H0 along-track behind
-    h = np.cross(r_c, v_c)
-    h /= np.linalg.norm(h)
-    R = _exp(h * cfg["waypoints"]["H0"][1] / oe.a)
-    return (r_c, v_c), (R @ r_c, R @ v_c)
+    return tuple(np.array(x, float) for x in orbitalMotion.elem2rv(mu, oe))
+
+
+def sun_position_at_epoch(cfg):
+    """Sun position (m, Earth-centered inertial) at the epoch, from a one-step
+    SPICE-only sim, so the client starts with its array attitude at t = 0."""
+    sim = SimulationBaseClass.SimBaseClass()
+    proc = sim.CreateNewProcess("p")
+    proc.addTask(sim.CreateNewTask("t", macros.sec2nano(1.0)))
+    grav = simIncludeGravBody.gravBodyFactory()
+    grav.createEarth().isCentralBody = True
+    grav.createSun()
+    spice = grav.createSpiceInterface(time=cfg["orbit"]["epoch"], epochInMsg=True)
+    spice.zeroBase = "Earth"
+    sim.AddModelToTask("t", spice)
+    sim.InitializeSimulation()
+    sim.ConfigureStopTime(0)
+    sim.ExecuteSimulation()
+    sun = np.array(spice.planetStateOutMsgs[1].read().PositionVector)
+    grav.unloadSpiceKernels()
+    return sun
+
+
+def client_dcm_AN(cfg):
+    """dcm_AN (= the client's dcm_BN) held for the whole run."""
+    r_c, v_c = _initial_state(cfg)
+    sun = sun_position_at_epoch(cfg) - r_c
+    return array_dcm(sun / np.linalg.norm(sun), r_c, v_c)
 
 
 def build(cfg, viz=True):
     """Assemble the simulation. Returns a dict of the parts."""
     sim = SimulationBaseClass.SimBaseClass()
     proc = sim.CreateNewProcess("proc")
-    dyn = cfg["dyn"]
-    proc.addTask(sim.CreateNewTask("env", macros.sec2nano(1.0)), 400)
-    proc.addTask(sim.CreateNewTask("dynFar", macros.sec2nano(dyn["dt_far_s"])), 300)
-    proc.addTask(sim.CreateNewTask("dynNear", macros.sec2nano(dyn["dt_near_s"])), 300)
-    proc.addTask(sim.CreateNewTask("fsw", macros.sec2nano(dyn["fsw_s"])), 200)
-    proc.addTask(sim.CreateNewTask("viz", macros.sec2nano(cfg["viz"]["rate_s"])), 100)
+    dt = macros.sec2nano(cfg["run"]["dt_s"])
+    for name, prio in (("env", 400), ("dyn", 300), ("fsw", 200), ("viz", 100)):
+        proc.addTask(sim.CreateNewTask(name, dt), prio)
 
+    dcm_AN = client_dcm_AN(cfg)
     grav = simIncludeGravBody.gravBodyFactory()
     earth = grav.createEarth()
     earth.isCentralBody = True
@@ -386,7 +314,7 @@ def build(cfg, viz=True):
     spice.zeroBase = "Earth"
     sim.AddModelToTask("env", spice)
 
-    (r_c, v_c), (r_s, v_s) = _initial_states(cfg)
+    r_c, v_c = _initial_state(cfg)
     m_c, _, I_c = client_mass_props(cfg, set())
     client = spacecraft.Spacecraft()
     client.ModelTag = "client"
@@ -394,23 +322,10 @@ def build(cfg, viz=True):
     client.hub.IHubPntBc_B = I_c.tolist()
     client.hub.r_CN_NInit = r_c.tolist()
     client.hub.v_CN_NInit = v_c.tolist()
-    servicer = spacecraft.Spacecraft()
-    servicer.ModelTag = "servicer"
-    servicer.hub.mHub = float(cfg["servicer"]["mass_kg"])
-    servicer.hub.IHubPntBc_B = np.diag(cfg["servicer"]["inertia"]).tolist()
-    servicer.hub.r_CN_NInit = r_s.tolist()
-    servicer.hub.v_CN_NInit = v_s.tolist()
-    ext = extForceTorque.ExtForceTorque()
-    ext.ModelTag = "servicerForce"
-    servicer.addDynamicEffector(ext)
-    force_msg = messaging.CmdForceInertialMsg()
-    ext.cmdForceInertialInMsg.subscribeTo(force_msg)
-    for sc in (client, servicer):
-        grav.addBodiesTo(sc)
-    for task in ("dynFar", "dynNear"):
-        sim.AddModelToTask(task, ext, 20)
-        sim.AddModelToTask(task, client, 10)
-        sim.AddModelToTask(task, servicer, 10)
+    client.hub.sigma_BNInit = [[x] for x in rbk.C2MRP(dcm_AN)]  # B = A, held (no torques)
+    client.hub.omega_BN_BInit = [[0.0], [0.0], [0.0]]
+    grav.addBodiesTo(client)
+    sim.AddModelToTask("dyn", client, 10)
 
     ecl = eclipse.Eclipse()
     ecl.ModelTag = "eclipse"
@@ -419,27 +334,26 @@ def build(cfg, viz=True):
     ecl.sunInMsg.subscribeTo(spice.planetStateOutMsgs[1])
     sim.AddModelToTask("fsw", ecl, 20)
 
-    swap = SwapSequence(cfg)
-    glue = Glue(cfg, client, servicer, spice.planetStateOutMsgs[1], ecl.eclipseOutMsgs[0],
-                force_msg, swap)
+    seq = GantrySequence(cfg)
+    glue = Glue(cfg, ecl.eclipseOutMsgs[0], seq)
     sim.AddModelToTask("fsw", glue, 10)
 
-    parts = dict(sim=sim, client=client, servicer=servicer, glue=glue, spice=spice,
-                 grav=grav, viz=None, writer=None)
+    names = [*seq.at(0.0).bodies, "overlay_red", "overlay_green"]
+    msgs = {n: messaging.SCStatesMsg() for n in names}
+    p0 = messaging.SCStatesMsgPayload()
+    p0.r_BN_N = list(r_c)
+    for m in msgs.values():  # valid states before the first writer call
+        m.write(p0, 0)
+    v = hud = None
     if viz:
-        from src.viz_setup import EXTRA_BODIES, hud_dialog, setup_viz
-        msgs = {n: messaging.SCStatesMsg() for n in EXTRA_BODIES}
-        p0 = messaging.SCStatesMsgPayload()
-        p0.r_BN_N = list(r_c - cfg["viz"]["park_m"] * r_c / np.linalg.norm(r_c))
-        for m in msgs.values():  # valid states before the first writer call
-            m.write(p0, 0)
-        v = setup_viz(sim, "viz", client, servicer, msgs, cfg)
+        from src.viz_setup import hud_dialog, setup_viz
+        v = setup_viz(sim, "viz", client, msgs, cfg)
         v.epochInMsg.subscribeTo(grav.epochMsg)  # Vizard shows the real date
         hud = hud_dialog()
-        writer = BodyWriter(cfg, glue, msgs, v, hud)
-        sim.AddModelToTask("viz", writer, 100)
-        parts.update(viz=v, writer=writer, msgs=msgs, hud=hud)
-    return parts
+    writer = BodyWriter(cfg, client, glue, msgs, v, hud)
+    sim.AddModelToTask("viz", writer, 100)
+    return dict(sim=sim, client=client, glue=glue, spice=spice, grav=grav, viz=v,
+                writer=writer, msgs=msgs, hud=hud, seq=seq, dcm_AN=dcm_AN)
 
 
 def run(cfg=None, viz=True, outdir=REPO / "outputs", verbose=False):
@@ -451,70 +365,89 @@ def run(cfg=None, viz=True, outdir=REPO / "outputs", verbose=False):
     if viz:
         cfg = dict(cfg, viz=dict(cfg["viz"], save_file=str(outdir / Path(cfg["viz"]["save_file"]).name)))
     P = build(cfg, viz=viz)
-    sim, glue = P["sim"], P["glue"]
-    dyn, rc = cfg["dyn"], cfg["run"]
-    near_m, far_m = dyn["near_m"], dyn["far_hysteresis"] * dyn["near_m"]
-    dts = {False: dyn["dt_far_s"], True: dyn["dt_near_s"]}
-    near = False
-
-    def set_rate(is_near):
-        sim.disableTask("dynFar" if is_near else "dynNear")
-        sim.enableTask("dynNear" if is_near else "dynFar")
-        glue.period_ns = macros.sec2nano(max(dyn["fsw_s"], dts[is_near]))
-
-    sim.disableTask("dynNear")
-    glue.period_ns = macros.sec2nano(max(dyn["fsw_s"], dts[near]))
+    sim, glue, writer, seq = P["sim"], P["glue"], P["writer"], P["seq"]
+    rc = cfg["run"]
     sim.InitializeSimulation()
-    t = 0.0
-    last_phase = None
+    t, last = 0.0, None
     while t < rc["t_max_s"]:
         t += rc["chunk_s"]
         sim.ConfigureStopTime(macros.sec2nano(t))
         sim.ExecuteSimulation()
-        r = glue.range
-        if r is not None and (r < near_m) != near and (not near or r > far_m):
-            near = not near
-            set_rate(near)
-        if verbose and glue.cmd is not None and glue.cmd.phase != last_phase:
-            last_phase = glue.cmd.phase
-            print(f"  t={t:8.0f} s  phase {last_phase} {PHASES[last_phase]}"
-                  f"  range {r:8.1f} m  wall {time.time() - wall0:6.1f} s", flush=True)
-        if glue.home_t is not None and t - glue.home_t >= rc["home_tail_s"]:
+        if verbose and glue.phase != last:
+            last = glue.phase
+            print(f"  t={t:7.0f} s  phase {last} {PHASES[last]:12s}"
+                  f"  wall {time.time() - wall0:6.1f} s", flush=True)
+        if glue.phase == 5 and glue.L["t"][-1] - glue.phase_start[5] >= rc["home_tail_s"]:
             break
     P["grav"].unloadSpiceKernels()
     L = glue.L
     log = RunLog(
-        t=np.array(L["t"]), rel_H=np.array(L["rel_H"]), rel_A=np.array(L["rel_A"]),
-        phase=np.array(L["phase"]), dv_used=np.array(L["dv"]),
-        array_power=np.array(L["power"]), module_ratios=np.array(L["ratios"]),
-        module_ids=glue.ids, arm_q=np.array(L["q"]), sub=L["sub"], overlay=L["overlay"],
-        events=glue.events, phase_start=dict(glue.phase_start), mass=np.array(L["mass"]),
-        cfg=cfg)
+        t=np.array(L["t"]), phase=np.array(L["phase"]), step=L["step"],
+        seq_t=np.array(L["seq_t"]), array_power=np.array(L["power"]),
+        module_ratios=np.array(L["ratios"]), module_ids=glue.ids,
+        bridge_x=np.array(L["bx"]), carriage_y=np.array(L["cy"]), fork_z=np.array(L["fz"]),
+        overlay=L["overlay"], events=glue.events, phase_start=dict(glue.phase_start),
+        seq_steps=list(seq.steps), seq_duration=float(seq.duration),
+        pre_fault_power=glue.pre_fault_power, trace=writer.trace, cfg=cfg)
     if viz:
+        from Basilisk.utilities import vizSupport
         vm = P["viz"]
         log.replay = Path(vm.protoFilename)
-        log.viz_settings = {"ambient": vm.settings.ambient}
+        log.viz_settings = {"ambient": vm.settings.ambient,
+                            "cameras": [c.displayName for c in vizSupport.stdCameraList]}
         del vm
     # Drop every reference to the sim and vizInterface: its destructor closes
     # (and flushes) the replay stream before anyone measures the file.
     P.clear()
-    del sim, glue, P
+    del sim, glue, writer, P
     gc.collect()
     log.wall_s = time.time() - wall0
     return log
 
 
+def beats(log):
+    """Video beats: [(label, t0, t1)] in sim seconds."""
+    ev = {}
+    for t, k, _ in log.events:
+        ev.setdefault(k, t)
+    ps = log.phase_start
+    t2 = ps[2]
+    out = [("Fault (strike -> service request)", log.cfg["power"]["strike_t_s"], ev["service_request"]),
+           ("Go / no-go (red on)", ps[1], ps[2])]
+    steps = log.seq_steps
+    for k, (s0, name) in enumerate(steps):
+        if name == "roll_home":
+            continue
+        s1 = steps[k + 1][0]
+        out.append((f"Gantry: {STEP_LABELS[name]}", t2 + s0, t2 + s1))
+    out += [("Checkout hold, then green", ps[3], ps[4]),
+            ("Roll home", ps[4], ps[5]),
+            ("Done (tail)", ps[5], float(log.t[-1]))]
+    return out
+
+
 def summary(log):
+    pre = log.pre_fault_power
     lines = [f"wall time       {log.wall_s:8.1f} s",
              f"sim time        {log.t[-1]:8.0f} s",
              f"final phase     {log.phase[-1]} ({PHASES[log.phase[-1]]})",
-             f"delta-v used    {log.dv_used[-1]:8.3f} m/s",
-             f"power restored  {100 * log.array_power[-1] / log.array_power[log.t < log.cfg["power"]["strike_t_s"]].mean():8.2f} % of pre-fault"]
+             f"power restored  {100 * log.array_power[-1] / pre:8.2f} % of pre-fault"]
     if log.replay is not None and log.replay.exists():
         lines.append(f"replay          {log.replay} ({log.replay.stat().st_size / 1e6:.1f} MB)")
+    if log.viz_settings.get("cameras"):
+        lines.append("cameras         " + ", ".join(log.viz_settings["cameras"]))
     lines.append("phase starts (sim s):")
     for k in sorted(log.phase_start):
-        lines.append(f"  {k} {PHASES[k]:20s} {log.phase_start[k]:8.1f}")
+        lines.append(f"  {k} {PHASES[k]:12s} {log.phase_start[k]:8.1f}")
+    lines.append("events (sim s):")
+    seen = set()
+    for t, k, m in log.events:
+        if (k, m) not in seen:
+            seen.add((k, m))
+            lines.append(f"  {t:8.1f}  {k} M{m}")
+    lines.append("video beats (sim s):")
+    for name, a, b in beats(log):
+        lines.append(f"  {a:7.0f} - {b:7.0f}  {name}")
     return "\n".join(lines)
 
 

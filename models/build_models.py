@@ -2,18 +2,15 @@
 
     python -m models.build_models          # build models/obj/ + previews
 
-Every model is written in the frame its Vizard body uses (Task 7 attaches
-each OBJ with vizSupport.createCustomModel):
+Every model is written in the frame its Vizard body uses (src/viz_setup.py
+attaches each OBJ with vizSupport.createCustomModel, rotation 0):
 
   client          A axes, origin at the array center. Array plane z = 0,
                   cells on +z (sun). 59 modules (M(2,7) is its own body),
                   truss behind the array, 4 m gold bus at z = -4.
   module          A axes when seated, origin at the module center. Cells on
                   +z, grapple fixture on the -z (back) face, its tip at the
-                  tool point (z = -(t/2 + grapple_gap)).
-  servicer        S axes (+x = arm face), origin at the servicer CoM.
-  arm_link_1..6   each in its own link frame from arm_motion.fk().
-  tool            tool frame (origin at the tool point, +x = approach axis).
+                  fork grapple point (z = -(t/2 + grapple_gap)).
   overlay_*       module frame, a 2.02 m plate at z = -0.04 (behind the back).
   bridge          gantry bridge (A axes), origin on the rail line at the beam
                   center (x, 0, bridge_z); carbon box truss, drive trucks on
@@ -24,8 +21,6 @@ each OBJ with vizSupport.createCustomModel):
   fork_F_head     gantry_motion.fork_geometry (F: head, crossbar, arm fittings).
   fork_*_stageN   telescoping stages, origin at the stage's +z (head) end,
                   running along -z (gantry_motion.stage_layout).
-  keepout_sphere  A axes, origin at the array center: the client.keepout_m
-                  sphere, amber, semi-transparent (MTL d, see MAT_ALPHA).
 
 All geometry is procedural: real CC0 textures (ambientCG) on beveled,
 lathed and trussed parts. Textures are copied or derived next to the OBJs
@@ -40,7 +35,6 @@ from PIL import Image, ImageDraw, ImageFilter
 
 from src.config import load_config
 from src.geometry import module_center, module_ids
-from src.modules.arm_motion import fk
 from src.modules.gantry_motion import stage_layout
 
 HERE = Path(__file__).resolve().parent
@@ -53,8 +47,7 @@ def _stage_names():
 
 
 GANTRY_NAMES = ["bridge", "carriage", "fork_W_head", "fork_F_head", *_stage_names()]
-NAMES = ["client", "module", "servicer", *(f"arm_link_{i}" for i in range(1, 7)),
-         "tool", "overlay_red", "overlay_green", "keepout_sphere", *GANTRY_NAMES]
+NAMES = ["client", "module", "overlay_red", "overlay_green", *GANTRY_NAMES]
 MODEL_FILES = {n: str(OBJ_DIR / f"{n}.obj") for n in NAMES}
 
 # --- materials ----------------------------------------------------------------
@@ -71,9 +64,8 @@ MATS = {
     "optics":      ("optics.png", None, 0.9, 200, 0.0, 0.1),
     "overlay_red":   ("overlay_red.png", None, 0.0, 1, 0.8, 1.0),
     "overlay_green": ("overlay_green.png", None, 0.0, 1, 0.8, 1.0),
-    "keepout":       ("keepout.png", None, 0.0, 1, 0.25, 4.0),
 }
-MAT_ALPHA = {"keepout": 0.15}  # MTL d; Vizard's OBJ loader renders d < 1 transparent
+MAT_ALPHA = {}  # name: MTL d; Vizard's OBJ loader renders d < 1 transparent
 CELLS_PER_TILE = 8          # SolarPanel001 has an 8 x 8 cell grid per tile
 CELL_M = 0.15               # target cell pitch on a module
 
@@ -144,7 +136,6 @@ def prepare_textures(out):
           out / "optics.png")
     for name, col in (("overlay_red", (255, 32, 24)), ("overlay_green", (40, 255, 70))):
         Image.new("RGB", (64, 64), col).save(out / f"{name}.png")
-    Image.new("RGB", (64, 64), (255, 158, 38)).save(out / "keepout.png")
 
 
 # --- mesh parts -----------------------------------------------------------------
@@ -444,15 +435,6 @@ def build_overlay(color):
     return m
 
 
-def build_keepout(cfg, n=48):
-    """Keep-out sphere about the array center (single-sided, outward normals)."""
-    R = cfg["client"]["keepout_m"]
-    th = np.linspace(0, np.pi, n + 1)
-    m = Model()
-    m.add("keepout", "keepout", lathe(list(zip(-R * np.cos(th), R * np.sin(th))), 4.0, 2 * n))
-    return m
-
-
 # --- client ---------------------------------------------------------------------
 
 # Slot-boundary truss: thin enough that a module (client.module_gap_m in from each
@@ -586,195 +568,6 @@ def build_client(cfg):
             m.add("bus_hardware", "dark_metal", cbox((0.3, 0.3, 0.12), corner - [0, 0, 0.06], 0.02))
             m.add("bus_hardware", "dark_metal", bell(0.025, 0.08, 0.2, "-z", corner - [0, 0, 0.12]))
     add_rails(m, cfg)
-    return m
-
-
-# --- servicer -------------------------------------------------------------------
-
-def build_servicer(cfg):
-    sx_, sy_, sz_ = cfg["servicer"]["size_m"]
-    hx, hy, hz = sx_ / 2, sy_ / 2, sz_ / 2
-    m = Model()
-    m.add("bus", "gold_mli", cbox((sx_, sy_, sz_), (0, 0, 0), 0.03, tex("gold_mli")))
-    # body solar panels (+-y) and an aft radiator
-    for sg in (-1, 1):
-        m.add("bus_panels", "aluminum", cbox((sx_ - 0.16, 0.012, sz_ - 0.26), (0, sg * (hy + 0.006), 0), 0.004))
-        rep = round((sx_ - 0.2) / CELL_M) / CELLS_PER_TILE, round((sz_ - 0.3) / CELL_M) / CELLS_PER_TILE
-        m.add("bus_panels", "solar_cells", quad((0, sg * (hy + 0.0125), 0), (-sg * (hx - 0.1), 0, 0),
-                                                (0, 0, hz - 0.15), rep))
-    m.add("bus_panels", "radiator", cbox((0.012, sy_ - 0.2, sz_ - 0.3), (-hx - 0.006, 0, 0.0), 0.004, 0.8))
-
-    # shoulder pedestal: front face -> link 1 housing
-    sh = np.array(cfg["arm"]["shoulder_m"], float)
-    x1 = sh[0] - (JOINT_R + 0.01)                        # embeds in the link-1 housing core
-    L = x1 - hx
-    m.add("pedestal", "aluminum", lathe([(0, 0), (0, 0.17), (0.02, 0.17), (0.02, 0.13), (0.07, 0.095),
-                                         (L - 0.025, 0.095), (L - 0.025, 0.11), (L, 0.11), (L, 0)],
-                                        0.3, 32, "x", (hx, 0, 0)))
-    m.add("pedestal", "dark_metal", lathe([(0.09, 0.0965), (0.13, 0.0965)], 0.2, 32, "x", (hx, 0, 0)))
-    for k in range(6):  # gussets
-        a = 2 * np.pi * k / 6 + np.pi / 6
-        d = np.array([0, np.cos(a), np.sin(a)])
-        e = np.array([0, -np.sin(a), np.cos(a)]) * 0.006
-        pts = [p + q for p in (np.array([hx + 0.02, 0, 0]) + d * 0.165, np.array([hx + 0.02, 0, 0]) + d * 0.09,
-                               np.array([hx + 0.11, 0, 0]) + d * 0.09) for q in (e, -e)]
-        m.add("pedestal", "aluminum", hull(pts, 0.2))
-
-    # front sensors: stereo camera, lidar, docking lights
-    m.add("sensors", "dark_metal", cbox((0.1, 0.1, 0.08), (hx + 0.05, 0.3, 0.3), 0.01))
-    m.add("sensors", "aluminum", lathe([(0, 0.035), (0.04, 0.035), (0.06, 0.045), (0.06, 0.04),
-                                        (0.02, 0.028), (0.02, 0)], 0.1, 20, "x", (hx + 0.1, 0.3, 0.3)))
-    m.add("sensors", "optics", lathe([(0.022, 0.028), (0.022, 0)], 0.1, 20, "x", (hx + 0.1, 0.3, 0.3)))
-    m.add("sensors", "aluminum", lathe([(0, 0), (0, 0.07), (0.1, 0.07), (0.1, 0)], 0.2, 28, "x", (hx, -0.3, 0.3)))
-    m.add("sensors", "optics", lathe([(0.03, 0.0715), (0.07, 0.0715)], 0.1, 28, "x", (hx, -0.3, 0.3)))
-    m.add("sensors", "dark_metal", lathe([(0.1005, 0.06), (0.1005, 0.0)], 0.1, 28, "x", (hx, -0.3, 0.3)))
-    for y in (-0.3, 0.3):
-        m.add("sensors", "aluminum", cbox((0.03, 0.09, 0.05), (hx + 0.015, y, -0.32), 0.006))
-        m.add("sensors", "optics", quad((hx + 0.0305, y, -0.32), (0, 0.035, 0), (0, 0, 0.018)))
-
-    # RCS pods at the eight bus corners (front pods fire +x, aft -x) and the main engine
-    for fx in (-1, 1):
-        for y in (-1, 1):
-            for z in (-1, 1):
-                p = np.array([fx * (hx - 0.06), y * (hy - 0.06), z * (hz - 0.06)])
-                m.add("thrusters", "dark_metal", cbox((0.1, 0.1, 0.1), p + [fx * 0.05, 0, 0], 0.012))
-                m.add("thrusters", "dark_metal", bell(0.006, 0.02, 0.045, "x" if fx > 0 else "-x",
-                                                      p + [fx * 0.1, 0, 0]))
-                m.add("thrusters", "dark_metal", bell(0.006, 0.02, 0.045, "y" if y > 0 else "-y",
-                                                      p + [fx * 0.05, y * 0.05, 0]))
-    m.add("thrusters", "dark_metal", bell(0.03, 0.11, 0.22, "-x", (-hx - 0.012, 0, 0)))
-    m.add("thrusters", "aluminum", lathe([(0, 0.0), (0, 0.06), (0.04, 0.045), (0.04, 0)], 0.2, 24, "-x", (-hx - 0.012 + 0.04, 0, 0)))
-
-    # spares/stow rack: deck beams on the bus face, corner rails, slot latches
-    r = cfg["arm"]["rack"]
-    s = cfg["client"]["slot_m"]
-    x0, x1r = r["x_m"] - s / 2, r["x_m"] + s / 2
-    for sg, name, nslots in ((1, "rack_top", 4), (-1, "rack_bottom", 2)):
-        zf = sg * hz
-        zs = [sg * (r["z0_m"] + r["dz_m"] * k) for k in range(nslots)]
-        zo = zs[-1] + sg * 0.06
-        zd = zf + sg * 0.012
-        for y in (-0.42, 0.42):
-            m.add(name, "aluminum", cbox((s + 0.04, 0.04, 0.024), (r["x_m"], y, zd), 0.004))
-        for x in (x0, x1r):
-            m.add(name, "aluminum", cbox((0.04, s + 0.08, 0.024), (x, 0, zd), 0.004))
-            for y in (-1, 1):
-                yp = y * (s / 2 + 0.02)
-                m.add(name, "aluminum", cbox((0.04, 0.04, abs(zo - zf)), (x, yp, (zo + zf) / 2), 0.006))
-                m.add(name, "dark_metal", cbox((0.05, 0.05, 0.02), (x, yp, zo), 0.005))
-                for z in zs:
-                    m.add(name, "dark_metal", cbox((0.05, 0.02, 0.016), (x, yp - y * 0.025, z), 0.003))
-    return m
-
-
-# --- arm ------------------------------------------------------------------------
-
-BOOM_R, CORE_R, JOINT_R = 0.055, 0.035, 0.068
-
-
-def link_spans(cfg):
-    """Joint-to-joint offset of links 1-6 along each link's +x (from fk at q = 0)."""
-    f = fk(np.zeros(6), cfg)
-    return [float((f[i + 1][0] - f[i][0]) @ f[i][1][:, 0]) for i in range(1, 7)]
-
-
-def _boom(m, L):
-    """Canadarm-style boom from x = 0 to L: core stubs, collars, white MLI tube."""
-    c0, c1 = 0.075, L - 0.075
-    m.add("span", "aluminum", lathe([(0, 0), (0, CORE_R), (c0, CORE_R), (c0, 0)], 0.2, 20, "x"),
-          lathe([(c1, 0), (c1, CORE_R), (L, CORE_R), (L, 0)], 0.2, 20, "x"))
-    m.add("span", "aluminum", lathe([(c0, 0), (c0, 0.062), (c0 + 0.008, 0.066), (c0 + 0.03, 0.066),
-                                     (c0 + 0.03, 0.058), (c0 + 0.05, 0.058), (c0 + 0.05, 0)], 0.2, 24, "x"),
-          lathe([(c1 - 0.05, 0), (c1 - 0.05, 0.058), (c1 - 0.03, 0.058), (c1 - 0.03, 0.066),
-                 (c1 - 0.008, 0.066), (c1, 0.062), (c1, 0)], 0.2, 24, "x"))
-    m.add("span", "white_mli", lathe([(c0 + 0.05, BOOM_R), (c1 - 0.05, BOOM_R)], tex("white_mli"), 24, "x"))
-    for xb in np.linspace(c0 + 0.05, c1 - 0.05, 4)[1:-1]:
-        m.add("bands", "dark_metal", lathe([(xb - 0.01, 0), (xb - 0.01, BOOM_R + 0.003),
-                                            (xb + 0.01, BOOM_R + 0.003), (xb + 0.01, 0)], 0.1, 24, "x"))
-
-
-def _clevis(m, x, r=JOINT_R):
-    """Fork plates either side of the next pitch joint at (x, 0, 0)."""
-    for sg in (-1, 1):
-        y0 = sg * 0.064
-        m.add("clevis", "aluminum", lathe([(0, 0), (0, r), (0.014, r), (0.014, 0)], 0.2, 24,
-                                          "y" if sg > 0 else "-y", (x, y0, 0)))
-        m.add("clevis", "aluminum", cbox((0.09, 0.014, 0.09), (x - 0.06, y0 + sg * 0.007, 0), 0.004))
-        m.add("clevis", "dark_metal", lathe([(0.014, 0), (0.014, 0.03), (0.02, 0.03), (0.02, 0)], 0.1, 16,
-                                            "y" if sg > 0 else "-y", (x, y0, 0)))
-
-
-def _camera(m, at):
-    at = np.asarray(at, float)
-    m.add("camera", "white_mli", cbox((0.09, 0.06, 0.06), at, 0.008, 0.2))
-    m.add("camera", "dark_metal", lathe([(0, 0.022), (0.03, 0.024), (0.03, 0.0)], 0.1, 16, "x", at + [0.045, 0, 0]))
-    m.add("camera", "optics", lathe([(0.0305, 0.018), (0.0305, 0)], 0.1, 16, "x", at + [0.045, 0, 0]))
-    m.add("camera", "aluminum", cbox((0.03, 0.03, 0.03), at - [0, 0, 0.04], 0.004))
-
-
-def build_link(i, cfg):
-    """arm_link_i in its fk link frame."""
-    L = link_spans(cfg)[i - 1]
-    m = Model()
-    if i == 1:    # shoulder yaw (z)
-        m.add("housing", "aluminum", housing(0.1, JOINT_R + 0.01, "z"))
-        m.add("housing", "dark_metal", lathe([(-0.02, JOINT_R + 0.012), (0.02, JOINT_R + 0.012)], 0.2, 28, "z"))
-    elif i in (2, 3):  # shoulder / elbow pitch (y) + boom
-        m.add("housing", "aluminum", housing(0.056, JOINT_R, "y"))
-        m.add("housing", "dark_metal", lathe([(-0.012, JOINT_R + 0.002), (0.012, JOINT_R + 0.002)], 0.2, 28, "y"))
-        _boom(m, L)
-        _clevis(m, L)
-        if i == 3:
-            _camera(m, (0.24, 0, BOOM_R + 0.045))
-    elif i == 4:  # wrist pitch (y)
-        m.add("housing", "aluminum", housing(0.056, JOINT_R - 0.004, "y"))
-    elif i == 5:  # wrist yaw (z)
-        m.add("housing", "aluminum", housing(0.07, 0.05, "z"))
-        m.add("housing", "dark_metal", lathe([(-0.012, 0.0515), (0.012, 0.0515)], 0.2, 24, "z"))
-    elif i == 6:  # wrist roll (x): roll collar and the mating flange the tool bolts to
-        x1 = L - EE_LEN
-        m.add("span", "aluminum", lathe([(0, 0), (0, CORE_R), (0.07, CORE_R), (0.07, 0)], 0.2, 20, "x"))
-        m.add("span", "dark_metal", lathe([(0.07, 0), (0.07, 0.07), (0.075, 0.075), (x1 - 0.012, 0.075),
-                                           (x1 - 0.012, EE_R + 0.004), (x1, EE_R + 0.004), (x1, 0)],
-                                          0.2, 28, "x"))
-    return m
-
-
-EE_LEN, EE_R, EE_RIN, EE_DEPTH = 0.19, 0.085, 0.07, 0.11
-
-
-def build_tool(cfg):
-    """End effector in the tool frame: shell from x = -EE_LEN to the open mouth
-    at the tool point (x = 0), snare inside, camera, lights and drive ribs on
-    the shell. Every part touches the shell; its back mates link 6's flange."""
-    m = Model()
-    x0 = -EE_LEN
-    m.add("effector", "white_mli", lathe([(x0, 0), (x0, EE_R - 0.006), (x0 + 0.006, EE_R), (-0.02, EE_R)],
-                                         0.3, 28, "x"))
-    m.add("effector", "aluminum", lathe([(-0.02, EE_R), (-0.02, EE_R + 0.006), (-0.004, EE_R + 0.006),
-                                         (0, EE_R), (0, EE_RIN), (-EE_DEPTH, EE_RIN), (-EE_DEPTH, 0)],
-                                        0.2, 28, "x"))
-    for k in range(3):  # snare drive ribs bonded to the shell
-        a = 2 * np.pi * k / 3 + np.pi / 6
-        d = np.array([0, np.cos(a), np.sin(a)])
-        m.add("effector", "dark_metal", cbox((0.14, 0.02, 0.02), (0, 0, 0), 0.004).xf(
-            rot_x(a), np.array([-0.1, 0, 0]) + d * (EE_R + 0.006)))
-    # snare: hub on the cavity floor, three wires anchored in the cavity wall
-    m.add("snare", "dark_metal", lathe([(-EE_DEPTH, 0), (-EE_DEPTH, 0.022), (-0.08, 0.014), (-0.08, 0)],
-                                       0.1, 16, "x"))
-    pts = [np.array([-0.035, EE_RIN * np.cos(a), EE_RIN * np.sin(a)]) for a in np.radians([90, 210, 330])]
-    for k in range(3):
-        m.add("snare", "dark_metal", tube(pts[k], pts[(k + 1) % 3], 0.004, 0.05, 8))
-    # camera on top of the shell (box sits on the shell surface)
-    at = np.array([-0.12, 0.0, EE_R + 0.028])
-    m.add("camera", "white_mli", cbox((0.09, 0.06, 0.06), at, 0.008, 0.2))
-    m.add("camera", "dark_metal", lathe([(0, 0.022), (0.03, 0.024), (0.03, 0.0)], 0.1, 16, "x", at + [0.045, 0, 0]))
-    m.add("camera", "optics", lathe([(0.0305, 0.018), (0.0305, 0)], 0.1, 16, "x", at + [0.045, 0, 0]))
-    # lights on the shell sides, facing +x
-    for y in (-1, 1):
-        c = np.array([-0.04, y * (EE_R + 0.008), 0.0])
-        m.add("lights", "aluminum", cbox((0.04, 0.02, 0.03), c, 0.004))
-        m.add("lights", "optics", quad(c + [0.0205, 0, 0], (0, 0.008, 0), (0, 0, 0.012)))
     return m
 
 
@@ -1209,11 +1002,8 @@ def gantry_anchors(cfg):
 # --- build ------------------------------------------------------------------------
 
 def builders(cfg):
-    out = {"client": build_client(cfg), "module": build_module(cfg), "servicer": build_servicer(cfg),
-           "tool": build_tool(cfg), "overlay_red": build_overlay("red"),
-           "overlay_green": build_overlay("green"), "keepout_sphere": build_keepout(cfg)}
-    for i in range(1, 7):
-        out[f"arm_link_{i}"] = build_link(i, cfg)
+    out = {"client": build_client(cfg), "module": build_module(cfg),
+           "overlay_red": build_overlay("red"), "overlay_green": build_overlay("green")}
     out.update({"bridge": build_bridge(cfg), "carriage": build_carriage(cfg),
                 "fork_W_head": build_fork_W_head(cfg), "fork_F_head": build_fork_F_head(cfg)})
     for k in ("W", "F"):
