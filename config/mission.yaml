@@ -19,6 +19,7 @@ client:
   grid: 8
   slot_m: 2.0
   module_thick_m: 0.05
+  grapple_gap_m: 0.05     # grapple point behind a module's back face
   bus_slots: [[4, 4], [4, 5], [5, 4], [5, 5]]
   target: [2, 7]
   keepout_m: 15
@@ -42,7 +43,7 @@ power:
 servicer:
   mass_kg: 250
   inertia: [40, 40, 30]
-  size_m: [1.0, 1.0, 1.2]
+  size_m: [1.2, 1.0, 1.0]  # bus box (x, y, z), centered at the CoM; +x is the arm face
   prop_kg: 15
   isp_s: 220
   max_thrust_n: 2.0
@@ -80,7 +81,18 @@ arm:
   rate_dps: 2.0
   tip_free_mps: 0.02
   tip_contact_mps: 0.01
-  rack_side: "+y"
+  shoulder_m: [0.9, 0.0, 0.0]  # on a 0.3 m pedestal off the front-face center
+  rack:                        # spares on top (+z), stow on the bottom (-z)
+    x_m: -0.6                  # panel center x; front edge at x = 0.4
+    z0_m: 0.55                 # innermost panel center |z|
+    dz_m: 0.08                 # spacing outward
+    standoff_m: 0.10           # lift-off from a slot
+    spare_slot: 3
+    stow_slot: 4
+  approach_m: 0.10             # tool standoff before capture / after release
+  pull_m: 0.50                 # extract / insert stroke at the array
+  retract_m: 0.80              # 6.12 straight draw-back before stowing
+  latch_s: 10.0                # latch / grapple actuation holds
   step_min: [1, 6, 2, 3, 2, 10, 6, 10, 2, 3, 2, 6]  # 6.1-6.12
 
 viz:

@@ -15,9 +15,12 @@ dcm_XY maps Y-frame vectors into X (v_X = dcm_XY @ v_Y), so the columns of
 dcm_SL are the L axes written in S.
 
 Arm: shoulder on a 0.3 m pedestal out from the front-face center, at
-SHOULDER = (0.9, 0, 0) (see "Pedestal" below). Joint axes at q = 0
+cfg arm.shoulder_m = (0.9, 0, 0) (see "Pedestal" below). Joint axes at q = 0
 (arm straight along +x_S): z, y at the shoulder; y at the elbow (1.1 m out);
 y, z, x at the wrist (another 1.1 m), then 0.3 m to the tool point.
+
+Mission numbers (bus size, shoulder, rack layout, strokes, holds) come
+from config/mission.yaml; only path-shaping tuning lives in this module.
 
 Rack: spare slots 0-3 on the +z (top) face, stow slots 4-5 on the -z
 (bottom) face. Panels lie parallel to the S x-y plane, centered at
@@ -56,22 +59,12 @@ import numpy as np
 
 from src.geometry import module_center
 
-SHOULDER = np.array([0.9, 0.0, 0.0])   # on a 0.3 m pedestal off the front face
-BUS_HALF = np.array([0.6, 0.5, 0.5])
-GRAPPLE_GAP = 0.05          # grapple point behind the module back face
-RACK_X, RACK_Z0, RACK_DZ = -0.6, 0.55, 0.08
-RACK_STANDOFF = 0.10        # lift-off from a rack slot (the forearm passes
-                            # ~0.2 m above the stack's front edge)
-# Carry via-points between the rack standoff and PULL behind the target
+# Carry via-points between the rack standoff and pull_m behind the target
 # slot, top stack (mirrored in z for the bottom): module center (x, z) and
 # tool pitch about y_S in deg (90 = tool down into the top rack, 180 = tool
 # pointing back, 270 = up, 360 = forward at the array). See
 # SwapSequence._rack_transfer_legs for why the panel tumbles 270 deg.
 CARRY_VIA = [(0.2, 1.5, 120.0), (0.6, 2.0, 180.0), (1.2, 1.6, 270.0), (1.7, 0.9, 315.0)]
-APPROACH = 0.10             # tool standoff before capture / after release
-PULL = 0.50                 # extract / insert stroke at the array
-RETRACT = 0.80              # 6.12 straight draw-back before stowing
-SPARE_SLOT, STOW_SLOT = 3, 4
 STEPS = ["6.1", "6.2", "6.3", "6.4", "6.5", "6.6",
          "6.7", "6.8", "6.9", "6.10", "6.11", "6.12"]
 Q_STOW = np.radians([0.0, -80.0, 160.0, -80.0, 0.0, 0.0])
@@ -85,7 +78,6 @@ Q_SWING = [np.radians([0.0, 90.0, 0.0, 0.0, 0.0, 0.0]),     # straight down
 # raised, then straight up (the only safe place to flip), then fold to stow.
 Q_UNWIND = [np.radians([0.0, 0.0, -120.0, 60.0, 0.0, 0.0]),
             np.radians([0.0, -90.0, 0.0, 0.0, 0.0, 0.0])]
-LATCH_S = 10.0              # latch / grapple actuation holds
 SLOW_MAX = 2.5              # moves run at no less than 1/SLOW_MAX of the limit
 MARGIN = 0.97               # fraction of each limit the profiles may use
 RAMP = 0.15
@@ -149,9 +141,19 @@ def a_to_s(p_A, cfg):
     return (np.asarray(p_A, float) - pos) @ dcm_AS
 
 
+def shoulder_S(cfg):
+    """Arm base (shoulder) position in S."""
+    return np.array(cfg["arm"]["shoulder_m"], float)
+
+
+def bus_half(cfg):
+    """Half-extents of the servicer bus box (centered at the S origin)."""
+    return np.array(cfg["servicer"]["size_m"], float) / 2
+
+
 def grapple_d(cfg):
     """Tool point to module center distance along the tool axis."""
-    return cfg["client"]["module_thick_m"] / 2 + GRAPPLE_GAP
+    return cfg["client"]["module_thick_m"] / 2 + cfg["client"]["grapple_gap_m"]
 
 
 def target_fixture_S(cfg):
@@ -169,9 +171,9 @@ def module_half(cfg):
     return np.array([cfg["client"]["module_thick_m"] / 2, s / 2, s / 2])
 
 
-def module_corners_S(c, R, half=None):
+def module_corners_S(c, R, cfg):
     """8 corners (8, 3) of a module with center c and dcm_SM R."""
-    h = np.array([0.025, 1.0, 1.0]) if half is None else half
+    h = module_half(cfg)
     signs = np.array([[i, j, k] for i in (-1, 1) for j in (-1, 1) for k in (-1, 1)])
     return np.asarray(c) + (signs * h) @ np.asarray(R).T
 
@@ -194,17 +196,18 @@ def obb_overlap(c1, R1, h1, c2, R2, h2, eps=1e-9):
     return True
 
 
-def _rack_z(k):
+def _rack_z(k, cfg):
+    r = cfg["arm"]["rack"]
     if k < 4:
-        return RACK_Z0 + RACK_DZ * k
-    return -(RACK_Z0 + RACK_DZ * (k - 4))
+        return r["z0_m"] + r["dz_m"] * k
+    return -(r["z0_m"] + r["dz_m"] * (k - 4))
 
 
 def rack_module_pose(k, cfg):
     """(center_S, dcm_SM) of the module parked in rack slot k (0-5).
     x_M points at the bus (-z on top, +z on the bottom): dcm = Ry(+-90 deg)."""
-    z = _rack_z(k)
-    return np.array([RACK_X, 0.0, z]), _ry(np.sign(z) * np.pi / 2)
+    z = _rack_z(k, cfg)
+    return np.array([cfg["arm"]["rack"]["x_m"], 0.0, z]), _ry(np.sign(z) * np.pi / 2)
 
 
 def rack_slot_pose(k, cfg):
@@ -218,7 +221,7 @@ def rack_slot_pose(k, cfg):
 def fk(q, cfg):
     """[(pos_S, dcm_SL)] for base, links 1-6 and the tool (8 entries)."""
     L1, L2, L3 = cfg["arm"]["links_m"]
-    sh = SHOULDER
+    sh = shoulder_S(cfg)
     R1 = _rz(q[0])
     R2 = R1 @ _ry(q[1])
     el = sh + R2[:, 0] * L1
@@ -394,7 +397,7 @@ def _cart_move(legs, q_seed, cfg, v_tip, step=0.005, max_jump_deg=3.0):
 @dataclass
 class ArmFrame:
     """Arm state at one instant. bodies: {name: (center_S, dcm_SM)} for every
-    module; contact: tool point within APPROACH (0.10 m) of a grapple point
+    module; contact: tool point within arm.approach_m (0.10 m) of a grapple point
     the sequence uses (target slot, spare slot 3, stow slot 4)."""
     q: np.ndarray
     step: str
@@ -421,14 +424,19 @@ class SwapSequence:
     actual_s)} for any step whose moves could not fit its ConOps duration.
     """
 
-    def __init__(self, cfg, target_fixture_S=None):
+    def __init__(self, cfg, fixture=None):
+        """fixture: target tool pose (pos_S, dcm_S), or just pos_S (tool
+        axis +x_S); defaults to target_fixture_S(cfg)."""
         self.cfg = cfg
-        if target_fixture_S is None:
-            target_fixture_S = globals()["target_fixture_S"](cfg)
-        if isinstance(target_fixture_S, tuple):
-            fix_p, fix_R = (np.asarray(x, float) for x in target_fixture_S)
+        a = cfg["arm"]
+        self._approach, self._pull, self._latch = a["approach_m"], a["pull_m"], a["latch_s"]
+        self._spare_slot, self._stow_slot = a["rack"]["spare_slot"], a["rack"]["stow_slot"]
+        if fixture is None:
+            fixture = target_fixture_S(cfg)
+        if isinstance(fixture, tuple):
+            fix_p, fix_R = (np.asarray(x, float) for x in fixture)
         else:
-            fix_p, fix_R = np.asarray(target_fixture_S, float), np.eye(3)
+            fix_p, fix_R = np.asarray(fixture, float), np.eye(3)
         self._d = grapple_d(cfg)
         self._step_s = dict(zip(STEPS, [60.0 * m for m in cfg["arm"]["step_min"]]))
         self.events, self.stretched, self._segs = [], {}, []
@@ -436,7 +444,8 @@ class SwapSequence:
         self._parked = {"module_target": (fix_p + self._d * fix_R[:, 0], fix_R.copy())}
         for k in range(4):
             self._parked[f"spare_{k}"] = rack_module_pose(k, cfg)
-        spare, stow = rack_slot_pose(SPARE_SLOT, cfg), rack_slot_pose(STOW_SLOT, cfg)
+        spare = rack_slot_pose(self._spare_slot, cfg)
+        stow = rack_slot_pose(self._stow_slot, cfg)
         self.contact_points = [fix_p, spare[0], stow[0]]
         self._build(fix_p, fix_R, spare, stow)
         self.duration = self._t
@@ -451,12 +460,12 @@ class SwapSequence:
         return np.array([x, 0.0, z]) - self._d * R[:, 0], R
 
     def _rack_transfer_legs(self, slot):
-        """Legs from a rack slot (seated) out to PULL behind the target slot,
+        """Legs from a rack slot (seated) out to arm.pull_m behind the target slot,
         as tool-pose callables: (extract_leg, transfer_legs).
 
         Planar route in y = 0, given for the top stack as module-center
         (x, z, pitch) via-points CARRY_VIA and mirrored in z for the bottom
-        stack: lift RACK_STANDOFF off the slot, rise up and forward clear of
+        stack: lift arm.rack.standoff_m off the slot, rise up and forward clear of
         the stack, then tumble the panel over in front of the servicer
         (tool down -> back -> up -> forward) and lower it upright.
 
@@ -468,10 +477,11 @@ class SwapSequence:
         panel must turn +270 deg. Turning the arm plane around (q1 = 180
         deg) would avoid it, but is outside the joint limits.
         """
-        sz = 1.0 if _rack_z(slot) > 0 else -1.0
-        zs = abs(_rack_z(slot))
-        pts = [(RACK_X, zs, 90.0), (RACK_X, zs + RACK_STANDOFF, 90.0)]
-        pts += list(CARRY_VIA) + [(self._seat_c[0] - PULL, 0.0, 360.0)]
+        rack = self.cfg["arm"]["rack"]
+        z = _rack_z(slot, self.cfg)
+        sz, zs = np.sign(z), abs(z)
+        pts = [(rack["x_m"], zs, 90.0), (rack["x_m"], zs + rack["standoff_m"], 90.0)]
+        pts += list(CARRY_VIA) + [(self._seat_c[0] - self._pull, 0.0, 360.0)]
         pts = [(x, sz * z, np.radians(sz * th)) for x, z, th in pts]
 
         def leg(a, b):
@@ -541,6 +551,7 @@ class SwapSequence:
         x = fix_R[:, 0]
         self._seat_c = fix_p + self._d * x
         free, cont = cfg["arm"]["tip_free_mps"], cfg["arm"]["tip_contact_mps"]
+        APPROACH, PULL, LATCH_S = self._approach, self._pull, self._latch
         pre = (fix_p - APPROACH * x, fix_R)
         out = (fix_p - PULL * x, fix_R)
 
@@ -558,7 +569,7 @@ class SwapSequence:
         self._run("6.5", [("move", cart([line((fix_p, fix_R), out)], cont)),
                           ("event", "release_client")])
         # 6.6: carry to the stow slot, insert, latch, let go.
-        ext, xfer = self._rack_transfer_legs(STOW_SLOT)
+        ext, xfer = self._rack_transfer_legs(self._stow_slot)
         m_xfer = cart([self._rev(l) for l in reversed(xfer)], free)
         m_ins = cart([self._rev(ext)], cont, m_xfer.q[-1])
         self._run("6.6", [("move", m_xfer), ("move", m_ins), ("hold", LATCH_S),
@@ -574,9 +585,9 @@ class SwapSequence:
         m_app = cart([line(pre3, spare)], cont, q_pre3)
         self._run("6.7", [("hold", LATCH_S), ("move", m_back), ("move", m_cross),
                           ("move", m_app), ("hold", LATCH_S),
-                          ("grab", f"spare_{SPARE_SLOT}")])
+                          ("grab", f"spare_{self._spare_slot}")])
         # 6.8: lift the spare off the rack and carry it behind the slot.
-        ext, xfer = self._rack_transfer_legs(SPARE_SLOT)
+        ext, xfer = self._rack_transfer_legs(self._spare_slot)
         m_ext = cart([ext], cont)
         m_xfer = cart(xfer, free, m_ext.q[-1])
         self._run("6.8", [("move", m_ext), ("move", m_xfer)])
@@ -588,7 +599,7 @@ class SwapSequence:
         self._run("6.11", [("hold", LATCH_S), ("release",), ("event", "release_tool"),
                            ("move", m_back)])
         # 6.12: draw the tool straight back from the seated spare, then stow.
-        m_ret = cart([line(pre, (fix_p - RETRACT * x, fix_R))], free)
+        m_ret = cart([line(pre, (fix_p - cfg["arm"]["retract_m"] * x, fix_R))], free)
         self._run("6.12", [("move", m_ret),
                            ("move", _joint_move(m_ret.q[-1], Q_STOW, cfg, via=Q_UNWIND))])
 
@@ -607,5 +618,5 @@ class SwapSequence:
         bodies = dict(sg.parked)
         if sg.held is not None:
             bodies[sg.held] = (p + self._d * R[:, 0], R)
-        contact = min(np.linalg.norm(p - c) for c in self.contact_points) <= APPROACH + 1e-9
+        contact = min(np.linalg.norm(p - c) for c in self.contact_points) <= self._approach + 1e-9
         return ArmFrame(q=q, step=sg.step, held=sg.held, bodies=bodies, contact=contact)
