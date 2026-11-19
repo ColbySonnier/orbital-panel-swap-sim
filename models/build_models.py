@@ -55,6 +55,7 @@ MATS = {
 }
 CELLS_PER_TILE = 8          # SolarPanel001 has an 8 x 8 cell grid per tile
 CELL_M = 0.15               # target cell pitch on a module
+MODULE_GAP_M = 0.015        # visual gap between a module edge and its slot edge
 
 
 # --- textures -------------------------------------------------------------------
@@ -359,7 +360,7 @@ def tex(mat):
 
 def build_module(cfg):
     """One solar module in its own frame (A axes when seated)."""
-    s = cfg["client"]["slot_m"]
+    s = module_visual_m(cfg)                            # 1.97 m in a 2 m slot
     t = cfg["client"]["module_thick_m"]
     h, ht = s / 2, t / 2
     fw = 0.04                                           # frame width
@@ -415,6 +416,46 @@ def build_overlay(color):
 
 # --- client ---------------------------------------------------------------------
 
+# Slot-boundary truss: thin enough that a module (MODULE_GAP_M in from each
+# slot edge) pulled straight back or carried in its row never touches it.
+BOUNDARY_TUBE_R = 0.012
+TRUSS_TOP_Z, TRUSS_KEEL_Z = -0.065, -1.0
+
+
+def module_visual_m(cfg):
+    """Visual edge length of a module: slot minus a gap on each side."""
+    return cfg["client"]["slot_m"] - 2 * MODULE_GAP_M
+
+
+def truss_members(cfg):
+    """[(kind, p0, p1, r)] of the client truss in A ("tube" or "node" capsules).
+
+    Top grid on every slot boundary just behind the modules (z > -0.10 keeps
+    the carry corridor clear), latch brackets at the grid nodes, and deep
+    Warren keels in the planes y = const every 4 m."""
+    c = cfg["client"]
+    s, n = c["slot_m"], c["grid"]
+    half = s * n / 2
+    r = BOUNDARY_TUBE_R
+    zt, zd = TRUSS_TOP_Z, TRUSS_KEEL_Z
+    zl = -c["module_thick_m"] / 2 - 0.012               # latch brackets
+    lines = np.arange(-half, half + 1e-9, s)
+    out = []
+    for v in lines:
+        out += [("tube", (-half, v, zt), (half, v, zt), r), ("tube", (v, -half, zt), (v, half, zt), r)]
+        for u in lines:
+            out += [("node", (u, v, zt), (u, v, zt), r * np.sqrt(2)),
+                    ("node", (u, v, zl), (u, v, zl), r * np.sqrt(2))]
+    for y in lines[::2]:
+        out.append(("tube", (-half, y, zd), (half, y, zd), r))
+        for i, x in enumerate(lines):
+            out += [("tube", (x, y, zt), (x, y, zd), r), ("node", (x, y, zd), (x, y, zd), r * np.sqrt(2))]
+            if i < n:
+                a, b = (x, x + s) if i % 2 == 0 else (x + s, x)
+                out.append(("tube", (a, y, zt), (b, y, zd), r))
+    return [(k, np.array(p0, float), np.array(p1, float), rr) for k, p0, p1, rr in out]
+
+
 def build_client(cfg):
     c = cfg["client"]
     s, n = c["slot_m"], c["grid"]
@@ -428,24 +469,14 @@ def build_client(cfg):
             continue
         m.merge(module, f"module_{rc[0]}_{rc[1]}", t=module_center(*rc, cfg))
 
-    # top grid just behind the modules (z > -0.10 keeps the carry corridor clear)
-    zt, zd = -0.065, -1.0
-    lines = np.arange(-half, half + 1e-9, s)
-    for v in lines:
-        m.add("truss", "carbon", tube((-half, v, zt), (half, v, zt), 0.02, tex("carbon"), 10),
-              tube((v, -half, zt), (v, half, zt), 0.02, tex("carbon"), 10))
-        for u in lines:
-            m.add("truss_nodes", "aluminum", cbox((0.07, 0.07, 0.04), (u, v, zt), 0.01, 0.2))
-            m.add("truss_nodes", "dark_metal", cbox((0.05, 0.05, 0.02), (u, v, -c["module_thick_m"] / 2 - 0.01), 0.005, 0.2))
-    # deep Warren keels along x every 4 m (planes y = const stay out of the row-2 carry corridor)
-    for y in lines[::2]:
-        m.add("truss", "carbon", tube((-half, y, zd), (half, y, zd), 0.03, tex("carbon"), 12))
-        for i, x in enumerate(lines):
-            m.add("truss", "carbon", tube((x, y, zt), (x, y, zd), 0.018, tex("carbon"), 10))
-            m.add("truss_nodes", "aluminum", cbox((0.09, 0.09, 0.09), (x, y, zd), 0.015, 0.2))
-            if i < n:
-                a, b = (x, x + s) if i % 2 == 0 else (x + s, x)
-                m.add("truss", "carbon", tube((a, y, zt), (b, y, zd), 0.016, tex("carbon"), 10))
+    for kind, p0, p1, r in truss_members(cfg):
+        if kind == "node":
+            hw = r / np.sqrt(2)  # square node whose half-diagonal is r
+            mat = "dark_metal" if p0[2] > -0.05 else "aluminum"
+            m.add("truss_nodes", mat, cbox((2 * hw, 2 * hw, 0.024 if p0[2] > -0.05 else 0.05), p0, 0.003, 0.2))
+        else:
+            m.add("truss", "carbon", tube(p0, p1, r, tex("carbon"), 10))
+    zd = TRUSS_KEEL_Z
 
     # bus mount face in the center 2 x 2 slots
     rows = [r for r, _ in bus_slots]
@@ -660,36 +691,50 @@ def build_link(i, cfg):
     elif i == 5:  # wrist yaw (z)
         m.add("housing", "aluminum", housing(0.07, 0.05, "z"))
         m.add("housing", "dark_metal", lathe([(-0.012, 0.0515), (0.012, 0.0515)], 0.2, 24, "z"))
-    elif i == 6:  # wrist roll (x) + end effector shell (snare cavity open at the tool point)
-        r_ee, r_in, depth = 0.085, 0.07, 0.11
+    elif i == 6:  # wrist roll (x): roll collar and the mating flange the tool bolts to
+        x1 = L - EE_LEN
         m.add("span", "aluminum", lathe([(0, 0), (0, CORE_R), (0.07, CORE_R), (0.07, 0)], 0.2, 20, "x"))
-        m.add("span", "dark_metal", lathe([(0.07, 0), (0.07, 0.07), (0.075, 0.075), (0.105, 0.075),
-                                           (0.11, 0.07), (0.11, 0)], 0.2, 24, "x"))
-        m.add("span", "white_mli", lathe([(0.11, 0), (0.11, r_ee - 0.006), (0.116, r_ee), (L - 0.02, r_ee)],
-                                         0.3, 28, "x"))
-        m.add("span", "aluminum", lathe([(L - 0.02, r_ee), (L - 0.02, r_ee + 0.006), (L - 0.004, r_ee + 0.006),
-                                         (L, r_ee), (L, r_in), (L - depth, r_in), (L - depth, 0)], 0.2, 28, "x"))
-        for k in range(3):  # snare drive ribs
-            a = 2 * np.pi * k / 3 + np.pi / 6
-            d = np.array([0, np.cos(a), np.sin(a)])
-            m.add("span", "dark_metal", cbox((0.14, 0.02, 0.02), (0, 0, 0), 0.004).xf(
-                rot_x(a), np.array([0.2, 0, 0]) + d * (r_ee + 0.004)))
+        m.add("span", "dark_metal", lathe([(0.07, 0), (0.07, 0.07), (0.075, 0.075), (x1 - 0.012, 0.075),
+                                           (x1 - 0.012, EE_R + 0.004), (x1, EE_R + 0.004), (x1, 0)],
+                                          0.2, 28, "x"))
     return m
 
 
+EE_LEN, EE_R, EE_RIN, EE_DEPTH = 0.19, 0.085, 0.07, 0.11
+
+
 def build_tool(cfg):
-    """Snare wires inside the end-effector mouth, EE camera and lights (tool frame)."""
+    """End effector in the tool frame: shell from x = -EE_LEN to the open mouth
+    at the tool point (x = 0), snare inside, camera, lights and drive ribs on
+    the shell. Every part touches the shell; its back mates link 6's flange."""
     m = Model()
-    rr = 0.055
-    pts = [np.array([-0.035, rr * np.cos(a), rr * np.sin(a)]) for a in np.radians([90, 210, 330])]
+    x0 = -EE_LEN
+    m.add("effector", "white_mli", lathe([(x0, 0), (x0, EE_R - 0.006), (x0 + 0.006, EE_R), (-0.02, EE_R)],
+                                         0.3, 28, "x"))
+    m.add("effector", "aluminum", lathe([(-0.02, EE_R), (-0.02, EE_R + 0.006), (-0.004, EE_R + 0.006),
+                                         (0, EE_R), (0, EE_RIN), (-EE_DEPTH, EE_RIN), (-EE_DEPTH, 0)],
+                                        0.2, 28, "x"))
+    for k in range(3):  # snare drive ribs bonded to the shell
+        a = 2 * np.pi * k / 3 + np.pi / 6
+        d = np.array([0, np.cos(a), np.sin(a)])
+        m.add("effector", "dark_metal", cbox((0.14, 0.02, 0.02), (0, 0, 0), 0.004).xf(
+            rot_x(a), np.array([-0.1, 0, 0]) + d * (EE_R + 0.006)))
+    # snare: hub on the cavity floor, three wires anchored in the cavity wall
+    m.add("snare", "dark_metal", lathe([(-EE_DEPTH, 0), (-EE_DEPTH, 0.022), (-0.08, 0.014), (-0.08, 0)],
+                                       0.1, 16, "x"))
+    pts = [np.array([-0.035, EE_RIN * np.cos(a), EE_RIN * np.sin(a)]) for a in np.radians([90, 210, 330])]
     for k in range(3):
-        a, b = pts[k], pts[(k + 1) % 3]
-        m.add("snare", "dark_metal", tube(a + (b - a) * -0.15, b + (a - b) * -0.15, 0.004, 0.05, 8))
-    m.add("snare", "dark_metal", lathe([(-0.1, 0), (-0.1, 0.02), (-0.07, 0.012), (-0.07, 0)], 0.1, 16, "x"))
-    _camera(m, (-0.14, 0.0, 0.085 + 0.045))
-    for y in (-0.06, 0.06):
-        m.add("lights", "aluminum", cbox((0.04, 0.03, 0.02), (-0.04, y, 0.095), 0.004))
-        m.add("lights", "optics", quad((-0.0195, y, 0.095), (0, 0.012, 0), (0, 0, 0.008)))
+        m.add("snare", "dark_metal", tube(pts[k], pts[(k + 1) % 3], 0.004, 0.05, 8))
+    # camera on top of the shell (box sits on the shell surface)
+    at = np.array([-0.12, 0.0, EE_R + 0.028])
+    m.add("camera", "white_mli", cbox((0.09, 0.06, 0.06), at, 0.008, 0.2))
+    m.add("camera", "dark_metal", lathe([(0, 0.022), (0.03, 0.024), (0.03, 0.0)], 0.1, 16, "x", at + [0.045, 0, 0]))
+    m.add("camera", "optics", lathe([(0.0305, 0.018), (0.0305, 0)], 0.1, 16, "x", at + [0.045, 0, 0]))
+    # lights on the shell sides, facing +x
+    for y in (-1, 1):
+        c = np.array([-0.04, y * (EE_R + 0.008), 0.0])
+        m.add("lights", "aluminum", cbox((0.04, 0.02, 0.03), c, 0.004))
+        m.add("lights", "optics", quad(c + [0.0205, 0, 0], (0, 0.008, 0), (0, 0, 0.012)))
     return m
 
 

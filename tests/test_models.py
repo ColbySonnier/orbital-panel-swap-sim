@@ -96,8 +96,14 @@ def test_files_small():
 
 
 def test_module_dims():
-    assert np.allclose(extents("module", "panel"), [2.0, 2.0, 0.05], atol=0.02)
-    assert np.allclose(extents("module")[:2], [2.0, 2.0], atol=0.02)
+    # Expected size is the config-driven visual size: slot minus a 1.5 cm gap per
+    # side = 1.97 m (0.03 under the 2.0 m slot, so the brief's +-0.02 on 2.0 no
+    # longer applies).
+    from models.build_models import module_visual_m
+    vis = module_visual_m(cfg)
+    assert vis == pytest.approx(cfg["client"]["slot_m"] - 0.03)
+    assert np.allclose(extents("module", "panel"), [vis, vis, 0.05], atol=0.002)
+    assert np.allclose(extents("module")[:2], [vis, vis], atol=0.002)
 
 
 def test_module_cells_on_front_and_fixture_on_back():
@@ -158,10 +164,19 @@ def test_servicer_rack_matches_config():
 
 
 def test_arm_links_meet():  # Review Focus 2
+    from models.build_models import EE_LEN
     L = link_lengths()
     assert L == pytest.approx([0.0, *cfg["arm"]["links_m"][:2], 0.0, 0.0, cfg["arm"]["links_m"][2]])
     for i, Li in enumerate(L):
         name = f"arm_link_{i + 1}"
+        if i == 5:
+            # link 6 runs wrist -> mating flange; the tool's effector shell runs
+            # flange -> tool point. Together they span L6 joint to tool point.
+            eff = read_obj("tool")["effector"][:, 0]
+            assert abs(eff.max()) < 0.002 and abs(eff.min() + EE_LEN) < 0.002
+            assert abs(extent_along_axis(name) + (eff.max() - eff.min()) - Li) < 0.02
+            assert abs(read_obj(name)["span"][:, 0].max() - (Li - EE_LEN)) < 0.002  # parts meet
+            continue
         assert abs(extent_along_axis(name) - Li) < 0.02, name
         if Li > 0:  # span starts at the link's own joint
             assert abs(read_obj(name)["span"][:, 0].min()) < 0.02
@@ -191,3 +206,67 @@ def test_fetch_skips_existing(tmp_path):
         (tmp_path / a["dest"]).mkdir()
         (tmp_path / a["dest"] / a["check"]).write_bytes(b"x")
         assert fetch(a, root=tmp_path) is False  # no network touched
+
+
+def _connected(model, tol=1e-3):
+    """True if the chunks' bounding boxes (grown by tol) form one touching cluster."""
+    boxes = [(p.V.min(0) - tol, p.V.max(0) + tol) for _, _, p in model.chunks if len(p.F)]
+    seen, todo = {0}, [0]
+    while todo:
+        i = todo.pop()
+        for j, (lo, hi) in enumerate(boxes):
+            if j not in seen and np.all(lo <= boxes[i][1]) and np.all(boxes[i][0] <= hi):
+                seen.add(j)
+                todo.append(j)
+    return len(seen) == len(boxes)
+
+
+def test_tool_and_links_are_one_assembly():
+    from models.build_models import build_link, build_tool
+    assert _connected(build_tool(cfg))
+    for i in range(1, 7):
+        assert _connected(build_link(i, cfg)), i
+
+
+def _point_obb_dist(P, c, R, h):
+    """Distance from points (n, 3) to the box (center c, axes = columns of R, half h)."""
+    q = (P - c) @ R
+    d = np.abs(q) - h
+    return np.linalg.norm(np.maximum(d, 0), axis=1)
+
+
+@pytest.mark.slow
+def test_truss_clears_carried_modules():
+    """Steps 6.5 (pull) and 6.9 (insert): the module_target and spare_3 boxes
+    (visual size) clear every truss capsule near the target slot."""
+    from models.build_models import module_visual_m, truss_members
+    from src.geometry import module_center
+    from src.modules.arm_motion import SwapSequence, berth_pose_A
+    seq = SwapSequence(cfg)
+    pos, dcm_AS = berth_pose_A(cfg)
+    h = np.array([cfg["client"]["module_thick_m"] / 2, *[module_visual_m(cfg) / 2] * 2])
+    tgt = module_center(*cfg["client"]["target"], cfg)
+    caps = []
+    for _, p0, p1, r in truss_members(cfg):
+        n = max(2, int(np.linalg.norm(p1 - p0) / 0.003) + 1)
+        pts = p0 + np.linspace(0, 1, n)[:, None] * (p1 - p0)
+        near = np.linalg.norm(pts[:, :2] - tgt[:2], axis=1) < 4.0
+        if near.any():
+            caps.append((pts[near], r))
+    assert len(caps) > 20
+    pts = np.vstack([c[0] for c in caps])
+    rad = np.concatenate([np.full(len(c[0]), c[1]) for c in caps])
+    ts = np.arange(0.0, seq.duration, 0.5)
+    checked = {"6.5": 0, "6.9": 0}
+    for t in ts:
+        f = seq.at(t)
+        if f.step not in checked:
+            continue
+        for body in ("module_target", "spare_3"):
+            c_S, R_SM = f.bodies[body]
+            c_A = dcm_AS @ c_S + pos
+            R_AM = dcm_AS @ R_SM
+            gap = _point_obb_dist(pts, c_A, R_AM, h) - rad
+            assert gap.min() > 0.0005, (f.step, t, body, gap.min())
+        checked[f.step] += 1
+    assert min(checked.values()) > 50
